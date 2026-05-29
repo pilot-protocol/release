@@ -319,16 +319,25 @@ async function serveChangelog(req: Request, env: Env, _ctx: ExecutionContext): P
     return json({ ...data, cached: true }, 200)
   }
 
-  // --- 4. Collect commits for the prompt ----------------------------------
+  // --- 4. Collect commits + diffs for the prompt --------------------------
   // Prefer the upstream commits (what TRIGGERED the bump). Falls back to
   // the receiver's own commits when this isn't a cascade tag.
-  let commitLines: string[] = []
+  let commits: any[] = []
+  let files: any[] = []
   let commitCount = 0
   let upstreamRepo: string | null = null
   let prevUpstream: string | null = null
 
+  const fetchCompare = async (repo: string, base: string, head: string) => {
+    try {
+      const c: any = await ghAPI(env, `repos/${repo}/compare/${base}...${head}`)
+      commits = c.commits ?? []
+      files = c.files ?? []
+      commitCount = commits.length
+    } catch (_e) { /* leave empty — LLM will say "minor change" */ }
+  }
+
   if (body.upstream_pkg && body.upstream_version) {
-    // Cascade case — describe what the upstream actually changed.
     upstreamRepo = body.upstream_pkg.includes('/')
       ? body.upstream_pkg
       : `pilot-protocol/${body.upstream_pkg}`
@@ -336,50 +345,84 @@ async function serveChangelog(req: Request, env: Env, _ctx: ExecutionContext): P
       return json({ error: `upstream repo not in allowlist: ${upstreamRepo}` }, 403)
     }
     prevUpstream = await findPreviousTag(env, upstreamRepo, body.upstream_version)
-    if (prevUpstream) {
-      try {
-        const compare: any = await ghAPI(env, `repos/${upstreamRepo}/compare/${prevUpstream}...${body.upstream_version}`)
-        commitLines = (compare.commits ?? [])
-          .slice(0, 30)                                    // bound prompt size
-          .map((c: any) => `- ${c.commit.message.split('\n')[0]}`)
-        commitCount = compare.commits?.length ?? 0
-      } catch (e) {
-        // Fall through — we'll still try to summarize on metadata alone.
-      }
-    }
+    if (prevUpstream) await fetchCompare(upstreamRepo, prevUpstream, body.upstream_version)
   } else {
-    // Non-cascade tag — describe what THIS repo changed since previous_tag.
     const prev = body.previous_tag ?? await findPreviousTag(env, body.repo, body.tag)
-    if (prev) {
-      try {
-        const compare: any = await ghAPI(env, `repos/${body.repo}/compare/${prev}...${body.tag}`)
-        commitLines = (compare.commits ?? [])
-          .slice(0, 30)
-          .map((c: any) => `- ${c.commit.message.split('\n')[0]}`)
-        commitCount = compare.commits?.length ?? 0
-      } catch (e) {
-        // continue with no commits
-      }
-    }
+    if (prev) await fetchCompare(body.repo, prev, body.tag)
   }
 
-  // --- 5. Build prompt + call LLM -----------------------------------------
+  // --- 5. Triviality detector — skip the LLM when there's nothing to say --
+  // Saves an inference and produces honest output. Trivial markers:
+  //   - only docs/README/.md changes
+  //   - net change < 5 lines and not in source code
+  const codeFiles = files.filter((f: any) =>
+    !f.filename.match(/\.(md|txt|rst|adoc|gitignore)$/i)
+    && !f.filename.startsWith('docs/')
+    && f.filename !== 'README.md'
+  )
+  if (commitCount > 0 && codeFiles.length === 0) {
+    const result: ChangelogResponse = {
+      summary: 'Documentation-only update; no code changes.',
+      upstream_pkg: body.upstream_pkg,
+      upstream_version: body.upstream_version,
+      commit_count: commitCount,
+      cached: false,
+    }
+    return json(result, 200)
+  }
+
+  // --- 6. Build prompt with actual file diffs -----------------------------
+  // Bound the prompt size: top 8 commits (by their own metadata) and top
+  // 8 files (by additions+deletions), each file's patch capped at 1500
+  // chars. Plenty of context for a 70B model with 128K window.
+  const commitBlock = commits.slice(0, 8).map((c: any) => {
+    const subj = (c.commit.message || '').split('\n')[0].slice(0, 200)
+    const sha = (c.sha || '').slice(0, 7)
+    return `- ${subj} (${sha})`
+  }).join('\n')
+
+  const fileDiffs = files
+    .slice()
+    .sort((a: any, b: any) => (b.additions + b.deletions) - (a.additions + a.deletions))
+    .slice(0, 8)
+    .map((f: any) => {
+      let patch = (f.patch || '').toString()
+      if (patch.length > 1500) patch = patch.slice(0, 1500) + '\n... [truncated]'
+      return `### ${f.filename}  (+${f.additions} −${f.deletions})\n\`\`\`diff\n${patch || '(binary or rename-only)'}\n\`\`\``
+    })
+    .join('\n\n')
+
+  const upstreamRange = upstreamRepo && prevUpstream
+    ? `${upstreamRepo} ${prevUpstream}…${body.upstream_version}`
+    : null
+
   const context = body.upstream_pkg
-    ? `${body.repo} ${body.tag} bumps ${body.upstream_pkg} to ${body.upstream_version}.`
+    ? `${body.repo} ${body.tag} is an auto-cascade bump that pins ${body.upstream_pkg}@${body.upstream_version}.`
     : `${body.repo} ${body.tag} is a direct release.`
 
-  const prompt = `You write release summaries for engineers. Be specific, technical, and concise.
+  const prompt = `You write factual release summaries for a Go-based overlay network project.
 
-Context: ${context}
+Output: ONE paragraph, 1–3 sentences, maximum 60 words. No bullet lists, no markdown headings, no marketing words. Start with a verb describing what changed (e.g. "Adds…", "Fixes…", "Removes…"). Do NOT restate version numbers; do NOT say "this release". Identify the user-facing impact when possible. If the commits are purely cosmetic ("smoke test", "trigger docs", etc.), say plainly that the bump is administrative.
 
-Commits that justify this release:
-${commitLines.length ? commitLines.join('\n') : '(no commits available — explain based on context alone)'}
+${context}${upstreamRange ? `\nDiff scope: ${upstreamRange}` : ''}
 
-Write the summary in 1-2 SHORT sentences explaining WHY this release happened and what changed. No marketing language. No "we are excited to announce". Start directly with the change.`
+Commits:
+${commitBlock || '(none)'}
 
-  const aiResponse: any = await env.AI.run('@cf/meta/llama-3.1-8b-instruct', {
-    messages: [{ role: 'user', content: prompt }],
-    max_tokens: 200,
+File diffs (top by churn):
+${fileDiffs || '(no file-level diff available)'}
+
+Summary:`
+
+  // 70B Llama is the default — quality jump from 8B is dramatic for this
+  // task. Allow caller override via body.model when experimenting.
+  const model: any = (body as any).model || '@cf/meta/llama-3.3-70b-instruct-fp8-fast'
+  const aiResponse: any = await env.AI.run(model, {
+    messages: [
+      { role: 'system', content: 'You write extremely concise, factual release notes for a Go overlay-network project. Engineers, not marketers, are your audience.' },
+      { role: 'user', content: prompt },
+    ],
+    max_tokens: 250,
     temperature: 0.2,
   })
 
