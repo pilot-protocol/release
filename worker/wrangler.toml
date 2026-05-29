@@ -23,3 +23,8 @@ ORG       = "pilot-protocol"
 [[r2_buckets]]
 binding = "ASSETS"
 bucket_name = "pilot-release-assets"
+
+# Workers AI: provides env.AI.run(...) for LLM inference. First ~10k
+# inferences/day are free. Used by /api/changelog.
+[ai]
+binding = "AI"

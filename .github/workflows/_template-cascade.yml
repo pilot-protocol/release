@@ -1,0 +1,43 @@
+name: cascade
+
+# Template that lives in every sibling's .github/workflows/cascade.yml.
+# Receives bump-upstream dispatches and forwards everything to the central
+# reusable tag-bump workflow. Adding a workflow_dispatch trigger lets us
+# exercise the cascade manually before the orchestrator notifies us.
+#
+# CHANGELOG_SECRET is an org-level secret on pilot-protocol. The reusable
+# workflow uses it to sign requests to pilotprotocol.network/api/changelog
+# for LLM-generated release summaries.
+
+on:
+  repository_dispatch:
+    types: [bump-upstream]
+  workflow_dispatch:
+    inputs:
+      upstream:
+        description: 'Upstream Go module (e.g. github.com/pilot-protocol/common)'
+        required: true
+        type: string
+      version:
+        description: 'Upstream version (e.g. v0.4.0 or v0.5.0-beta.1)'
+        required: true
+        type: string
+      is_prerelease:
+        description: 'true if upstream is a beta/rc'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    uses: pilot-protocol/release/.github/workflows/tag-bump.yml@main
+    with:
+      upstream: ${{ inputs.upstream || github.event.client_payload.upstream }}
+      version: ${{ inputs.version || github.event.client_payload.version }}
+      is_prerelease: ${{ inputs.is_prerelease == true || github.event.client_payload.is_prerelease == true }}
+      stable_only: true
+    secrets:
+      CHANGELOG_SECRET: ${{ secrets.CHANGELOG_SECRET }}
