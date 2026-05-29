@@ -1,0 +1,25 @@
+name = "pilot-release"
+main = "src/index.ts"
+compatibility_date = "2026-05-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Route everything that hits pilotprotocol.network/install.sh,
+# /.well-known/latest.json, /.well-known/cascade-status.json through
+# this worker. The website (Cloudflare Pages) handles the rest.
+routes = [
+  { pattern = "pilotprotocol.network/install.sh", custom_domain = false },
+  { pattern = "pilotprotocol.network/.well-known/*", custom_domain = false },
+]
+
+[vars]
+HUB_OWNER = "TeoSlayer"
+HUB_REPO  = "pilotprotocol"
+ORG       = "pilot-protocol"
+
+# Secrets (set via `wrangler secret put`):
+#   GH_TOKEN — fine-grained PAT or installation token with repo:read on
+#              the hub repo + pilot-protocol/* (for cascade-status).
+
+[[r2_buckets]]
+binding = "ASSETS"
+bucket_name = "pilot-release-assets"

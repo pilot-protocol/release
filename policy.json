@@ -1,0 +1,45 @@
+{
+  "_purpose": "Hand-maintained sidecar consumed by scripts/compute-closure.py and the receiver workflows. Every other piece of state (graph edges, latest versions, install URLs) is derived from live tags and go.mod files.",
+  "_zones": {
+    "0": "Freeloader — not in cascade; no tag, no release",
+    "1": "Tag-only Go module — auto-cascade auto-tags beta",
+    "2": "Artifact hub — cascade opens daily PR; tag = full release pipeline",
+    "3": "Package distribution (npm/pypi/swiftpm/brew) — cascade opens PR; tag publishes",
+    "4": "Surface — deploys from main; no version semantics"
+  },
+  "nodes": {
+    "common":        { "zone": 1, "bump_policy": { "stable_only": true,  "mode": "auto" } },
+    "beacon":        { "zone": 1, "bump_policy": { "stable_only": true,  "mode": "auto" } },
+    "dataexchange":  { "zone": 1, "bump_policy": { "stable_only": true,  "mode": "auto" } },
+    "eventstream":   { "zone": 1, "bump_policy": { "stable_only": true,  "mode": "auto" } },
+    "gateway":       { "zone": 1, "bump_policy": { "stable_only": true,  "mode": "auto" } },
+    "handshake":     { "zone": 1, "bump_policy": { "stable_only": true,  "mode": "auto" } },
+    "nameserver":    { "zone": 1, "bump_policy": { "stable_only": true,  "mode": "auto" } },
+    "policy":        { "zone": 1, "bump_policy": { "stable_only": true,  "mode": "auto" } },
+    "rendezvous":    { "zone": 1, "bump_policy": { "stable_only": true,  "mode": "auto" } },
+    "runtime":       { "zone": 1, "bump_policy": { "stable_only": true,  "mode": "auto" } },
+    "skillinject":   { "zone": 1, "bump_policy": { "stable_only": true,  "mode": "auto" } },
+    "trustedagents": { "zone": 1, "bump_policy": { "stable_only": true,  "mode": "auto" } },
+    "updater":       { "zone": 1, "bump_policy": { "stable_only": true,  "mode": "auto" } },
+    "webhook":       { "zone": 1, "bump_policy": { "stable_only": true,  "mode": "auto" } },
+    "app-store":     { "zone": 1, "bump_policy": { "stable_only": true,  "mode": "auto" } },
+    "libpilot":      { "zone": 1, "bump_policy": { "stable_only": true,  "mode": "auto", "_note": "Auto-tag is OK; libpilot's beta tags are Go modules. SDKs that bundle libpilot get PR-mode." } },
+    "examples":      { "zone": 1, "bump_policy": { "stable_only": true,  "mode": "auto" } },
+
+    "web4":          { "zone": 2, "bump_policy": { "stable_only": true,  "mode": "pr",   "_note": "PR-mode prevents daemon auto-releases; humans decide when to ship a new binary." } },
+
+    "sdk-node":      { "zone": 3, "bump_policy": { "stable_only": true,  "mode": "pr" } },
+    "sdk-python":    { "zone": 3, "bump_policy": { "stable_only": true,  "mode": "pr" } },
+    "sdk-swift":     { "zone": 3, "bump_policy": { "stable_only": true,  "mode": "pr" } },
+    "homebrew-pilot":{ "zone": 3, "bump_policy": { "stable_only": true,  "mode": "auto", "_note": "Formula bump is safe to auto-apply once the upstream stable tag exists." } },
+
+    "website":       { "zone": 4, "bump_policy": { "stable_only": false, "mode": "auto", "_note": "Cloudflare Pages redeploys from main; manifest worker auto-refreshes." } }
+  },
+  "manual_nodes": {
+    "homebrew-pilot": { "repo": "TeoSlayer/homebrew-pilot", "depends_on": ["web4"] },
+    "website":        { "repo": "pilot-protocol/website",   "depends_on": ["web4"] },
+    "cosift":         { "repo": "pilot-protocol/cosift",    "depends_on": [] },
+    "pilot-ca":       { "repo": "pilot-protocol/pilot-ca",  "depends_on": [] },
+    "wallet":         { "repo": "pilot-protocol/wallet",    "depends_on": ["app-store"] }
+  }
+}

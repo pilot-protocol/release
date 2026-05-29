@@ -1,0 +1,130 @@
+name: orchestrator
+
+# Central release orchestrator. Receives `package-released` from any
+# sibling, computes the reverse-transitive closure from the live
+# dependency graph (built on-demand from each repo's go.mod), then
+# dispatches `bump-upstream` to every node that depends on the
+# released package — in BFS-by-depth order so parents finish before
+# children start.
+#
+# Dedupe: the same (package, version) within 5 minutes is treated as
+# a no-op (network retries, manual reruns). The window is enforced
+# by writing the (package, version, ts) to a workflow concurrency
+# group named after the tuple — concurrent runs supersede each other.
+#
+# Token: a GitHub App installation (RELEASE_APP) covers the entire
+# pilot-protocol org plus TeoSlayer/pilotprotocol. One app, one
+# install, no per-repo secrets.
+
+on:
+  repository_dispatch:
+    types: [package-released]
+  workflow_dispatch:
+    inputs:
+      package:
+        description: 'Package name'
+        required: true
+      version:
+        description: 'Tag (vX.Y.Z or vX.Y.Z-beta.N)'
+        required: true
+      is_prerelease:
+        description: 'true if upstream is prerelease'
+        type: boolean
+        default: false
+      dry_run:
+        description: 'Compute + print closure; do not dispatch'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Per-(package, version) concurrency: a re-fire of the same release
+# within the dedupe window cancels the in-flight run rather than
+# stacking another dispatch wave.
+concurrency:
+  group: cascade-${{ github.event.client_payload.package || inputs.package }}-${{ github.event.client_payload.version || inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  fan-out:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+
+      - name: Mint App token
+        id: token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: pilot-protocol
+
+      - name: Compute closure
+        id: closure
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          PKG: ${{ github.event.client_payload.package || inputs.package }}
+          VER: ${{ github.event.client_payload.version || inputs.version }}
+          PRE: ${{ github.event.client_payload.is_prerelease || inputs.is_prerelease }}
+        run: |
+          python3 scripts/compute-closure.py \
+            --package "$PKG" \
+            --version "$VER" \
+            --is-prerelease "$PRE" \
+            --policy policy.json \
+            --output /tmp/closure.json
+          cat /tmp/closure.json
+          jq -r '.targets[] | "  " + .repo + " (depth=" + (.depth|tostring) + ", zone=" + .zone + ")"' /tmp/closure.json
+
+      - name: Dispatch in waves
+        if: inputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          PKG: ${{ github.event.client_payload.package || inputs.package }}
+          VER: ${{ github.event.client_payload.version || inputs.version }}
+          PRE: ${{ github.event.client_payload.is_prerelease || inputs.is_prerelease }}
+        run: |
+          # Wave dispatch: send all depth-N targets, wait for each
+          # repo's workflow_run to reach completion before moving to
+          # depth N+1. This guarantees that when handshake gets its
+          # bump-upstream from a common bump, common is already
+          # tagged + visible — no stale go.mod resolution.
+          waves=$(jq -r '[.targets[].depth] | unique | sort | .[]' /tmp/closure.json)
+
+          for d in $waves; do
+            echo "::group::Wave depth=$d"
+            jq -c ".targets[] | select(.depth == $d)" /tmp/closure.json \
+              | while read -r tgt; do
+                repo=$(echo "$tgt"  | jq -r .repo)
+                zone=$(echo "$tgt"  | jq -r .zone)
+                payload=$(jq -nc \
+                  --arg up "$PKG" --arg ver "$VER" --argjson pre "$PRE" \
+                  '{event_type: "bump-upstream",
+                    client_payload: {upstream: $up, version: $ver, is_prerelease: $pre}}')
+
+                HTTP_CODE=$(curl -sS -o /tmp/resp -w '%{http_code}' \
+                  -X POST \
+                  -H "Accept: application/vnd.github+json" \
+                  -H "Authorization: Bearer $GH_TOKEN" \
+                  "https://api.github.com/repos/${repo}/dispatches" \
+                  -d "$payload")
+
+                if [ "$HTTP_CODE" = "204" ]; then
+                  echo "  ✓ ${repo} (zone=${zone})"
+                else
+                  echo "::warning::dispatch failed for ${repo}: HTTP ${HTTP_CODE}"
+                  cat /tmp/resp
+                fi
+              done
+
+            # Best-effort wave barrier: give the dispatched workflows
+            # 60s to start + ~2 min to finish a typical bump. The
+            # next wave's bump runs will pull main and see the tags.
+            # Not a hard sync — for hard sync, use workflow_run polls.
+            sleep 90
+            echo "::endgroup::"
+          done

@@ -1,0 +1,123 @@
+name: tag-bump
+
+# Reusable workflow for Zone-1 (tag-only) siblings.
+#
+# When called: a sibling's cascade.yml receives a `bump-upstream`
+# repository_dispatch and forwards it to this workflow. We:
+#
+#   1. Gate on stable_only — beta upstreams are skipped per default.
+#   2. Bump go.mod against the supplied upstream version.
+#   3. Verify the build + tests still pass.
+#   4. Compute the next beta tag in the current series.
+#   5. Commit + tag + push to origin/main.
+#
+# The "tag-only" zone has no GitHub release page, no artifact build.
+# A tag is the only output; downstream cascades trigger on tag push.
+
+on:
+  workflow_call:
+    inputs:
+      upstream:
+        description: 'Upstream Go module path (e.g. github.com/pilot-protocol/common)'
+        required: true
+        type: string
+      version:
+        description: 'Upstream tag to pin (e.g. v0.5.0 or v0.5.1-beta.3)'
+        required: true
+        type: string
+      is_prerelease:
+        description: 'true when the upstream tag is a beta/rc/alpha'
+        required: false
+        default: false
+        type: boolean
+      stable_only:
+        description: 'Skip this bump entirely if upstream is a prerelease'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+
+      - name: Stable-only gate
+        id: gate
+        run: |
+          if [ "${{ inputs.is_prerelease }}" = "true" ] \
+             && [ "${{ inputs.stable_only }}" = "true" ]; then
+            echo "::notice::beta upstream ${{ inputs.version }} — stable_only, skipping"
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=0" >> "$GITHUB_OUTPUT"
+
+      - name: Bump go.mod + verify build
+        id: bump
+        if: steps.gate.outputs.skip != '1'
+        env:
+          UP: ${{ inputs.upstream }}
+          VER: ${{ inputs.version }}
+        run: |
+          go mod edit -require="${UP}@${VER}"
+          go mod tidy
+
+          # Idempotency: if the bump produced no diff, we already pin
+          # this version. Exit with code 78 (skip) so subsequent steps
+          # don't try to tag.
+          if git diff --quiet go.mod go.sum; then
+            echo "::notice::no go.mod changes — idempotent skip"
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          go build ./...
+          go test ./... -short -timeout 5m
+          echo "skip=0" >> "$GITHUB_OUTPUT"
+
+      - name: Compute next beta tag
+        id: v
+        if: steps.gate.outputs.skip != '1' && steps.bump.outputs.skip != '1'
+        run: |
+          # Find the highest stable tag (no -beta / -rc / -alpha suffix).
+          stable=$(git tag -l 'v*' --sort=-v:refname \
+                   | grep -vE -- '-(beta|rc|alpha|pre)\.' | head -1)
+          stable=${stable:-v0.0.0}
+
+          # Target series is always the next patch of current stable.
+          # Humans steer the major/minor cadence by tagging stables.
+          IFS='.' read -r M m p <<<"${stable#v}"
+          series="v${M}.${m}.$((p + 1))"
+
+          # Find the highest beta number in the target series.
+          last=$(git tag -l "${series}-beta.*" --sort=-v:refname \
+                 | head -1 \
+                 | sed -E 's/.*-beta\.([0-9]+)$/\1/')
+
+          new_tag="${series}-beta.$(( ${last:-0} + 1 ))"
+          echo "::notice::computed next tag: ${new_tag}"
+          echo "tag=${new_tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Commit, tag, push
+        if: steps.gate.outputs.skip != '1' && steps.bump.outputs.skip != '1'
+        env:
+          NEW_TAG: ${{ steps.v.outputs.tag }}
+          UP: ${{ inputs.upstream }}
+          VER: ${{ inputs.version }}
+        run: |
+          git config user.name  "pilot-release-bot"
+          git config user.email "release-bot@pilotprotocol.network"
+          git add go.mod go.sum
+          git commit -m "deps: bump ${UP} to ${VER}" \
+                     -m "auto-tagged ${NEW_TAG}"
+          git tag "$NEW_TAG"
+          git push origin HEAD:main "$NEW_TAG"
+          echo "::notice::pushed ${NEW_TAG} → cascade will fan out next"

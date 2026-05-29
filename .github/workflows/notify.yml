@@ -1,0 +1,61 @@
+name: notify
+
+# Reusable workflow every sibling calls at the end of its own
+# release.yml (or directly on tag push, for tag-only repos). Emits
+# a `package-released` repository_dispatch to the orchestrator.
+#
+# Required secret (or App token passed in):
+#   ORCH_TOKEN — a GitHub App installation token (preferred) or PAT
+#   with `repository_dispatch` scope on the orchestrator repo.
+
+on:
+  workflow_call:
+    inputs:
+      package:
+        description: 'Node name in policy.json'
+        required: true
+        type: string
+      version:
+        description: 'Tag that just shipped'
+        required: false
+        default: ''
+        type: string
+    secrets:
+      ORCH_TOKEN:
+        required: true
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Emit package-released
+        env:
+          TOKEN: ${{ secrets.ORCH_TOKEN }}
+          PKG: ${{ inputs.package }}
+          VER: ${{ inputs.version || github.ref_name }}
+        run: |
+          # Detect prerelease from the version suffix. The orchestrator
+          # also re-validates this; defense in depth.
+          IS_PRE=false
+          case "$VER" in
+            *-beta.*|*-rc.*|*-alpha.*|*-pre.*) IS_PRE=true ;;
+          esac
+
+          payload=$(jq -nc \
+            --arg pkg "$PKG" --arg ver "$VER" --argjson pre "$IS_PRE" \
+            '{event_type: "package-released",
+              client_payload: {package: $pkg, version: $ver, is_prerelease: $pre}}')
+
+          HTTP_CODE=$(curl -sS -o /tmp/resp -w '%{http_code}' \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $TOKEN" \
+            "https://api.github.com/repos/pilot-protocol/release/dispatches" \
+            -d "$payload")
+
+          if [ "$HTTP_CODE" != "204" ]; then
+            echo "::error::orchestrator notify failed (HTTP $HTTP_CODE):"
+            cat /tmp/resp
+            exit 1
+          fi
+          echo "::notice::orchestrator notified: ${PKG} ${VER} (prerelease=${IS_PRE})"

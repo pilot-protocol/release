@@ -1,0 +1,117 @@
+name: release-bump
+
+# Reusable workflow for Zone-2/3 (artifact-bearing) siblings.
+#
+# Zone-2/3 repos produce artifacts users install: web4 ships binaries,
+# homebrew-pilot ships a formula, sdk-* ships packages. We never
+# auto-tag in these zones — a maintainer must explicitly decide a
+# release is appropriate. Instead, we open or update a single daily
+# PR that coalesces every bump-upstream dispatch into one reviewable
+# change. The maintainer merges when they want to ship.
+#
+# Why coalesce: a single common bump cascades to 15+ siblings, each
+# of which fires its own tag, each of which dispatches another
+# bump-upstream to web4. Without coalescing, web4 receives 15+ open
+# PRs in rapid succession. With daily coalescing, the maintainer
+# sees one PR per day with N commits, one per bumped upstream.
+
+on:
+  workflow_call:
+    inputs:
+      upstream:
+        description: 'Upstream Go module path'
+        required: true
+        type: string
+      version:
+        description: 'Upstream tag to pin'
+        required: true
+        type: string
+      is_prerelease:
+        description: 'true when the upstream tag is a beta/rc/alpha'
+        required: false
+        default: false
+        type: boolean
+      stable_only:
+        description: 'Skip this bump entirely if upstream is a prerelease'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+
+      - name: Stable-only gate
+        id: gate
+        run: |
+          if [ "${{ inputs.is_prerelease }}" = "true" ] \
+             && [ "${{ inputs.stable_only }}" = "true" ]; then
+            echo "::notice::beta upstream ${{ inputs.version }} — stable_only, skipping"
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=0" >> "$GITHUB_OUTPUT"
+
+      - name: Coalesce into daily bump branch
+        if: steps.gate.outputs.skip != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UP: ${{ inputs.upstream }}
+          VER: ${{ inputs.version }}
+        run: |
+          BRANCH="bump/$(date -u +%Y-%m-%d)"
+
+          # If the daily branch already exists on remote, fetch + check
+          # it out so this commit lands on top of any earlier bump
+          # from today. Otherwise create it.
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            git fetch origin "$BRANCH"
+            git checkout "$BRANCH"
+            git pull --rebase origin "$BRANCH"
+          else
+            git checkout -b "$BRANCH"
+          fi
+
+          go mod edit -require="${UP}@${VER}"
+          go mod tidy
+
+          if git diff --quiet go.mod go.sum; then
+            echo "::notice::no go.mod changes — idempotent skip"
+            exit 0
+          fi
+
+          # Verify the bumped tree still builds + tests pass. If it
+          # doesn't, leave the diff uncommitted so the next attempt
+          # picks it up after the upstream issue is fixed.
+          go build ./...
+          go test ./... -short -timeout 5m
+
+          git config user.name  "pilot-release-bot"
+          git config user.email "release-bot@pilotprotocol.network"
+          git add go.mod go.sum
+          git commit -m "deps: bump ${UP} to ${VER}"
+          git push origin "$BRANCH"
+
+          # Open the PR if one is not already open for this branch.
+          # If it exists, the push above appended a new commit; no
+          # second PR is created.
+          existing=$(gh pr list --head "$BRANCH" --state open \
+                       --json number -q '.[0].number')
+          if [ -z "$existing" ]; then
+            gh pr create \
+              --base main --head "$BRANCH" \
+              --title "deps: daily bump $(date -u +%Y-%m-%d)" \
+              --body "Auto-cascade from upstream releases. This PR coalesces every bump-upstream dispatch that arrived today; merge it when the daemon is ready to ship a new release. A merged commit on main fires the repo's own release.yml which tags + builds + publishes binaries. Until then, this PR is the queue."
+          else
+            echo "::notice::PR #${existing} already open for ${BRANCH}; appended commit"
+          fi
