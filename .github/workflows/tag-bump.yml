@@ -67,12 +67,25 @@ jobs:
           UP: ${{ inputs.upstream }}
           VER: ${{ inputs.version }}
         run: |
+          # Strip any `replace github.com/pilot-protocol/...` lines
+          # that live in main. These are local-dev artifacts that
+          # point at ../sibling paths which CI doesn't have. With
+          # them present, `go mod tidy` fails to resolve. Without
+          # them, go uses the real published version, which is what
+          # production should always use anyway.
+          grep -E '^replace[[:space:]]+github\.com/pilot-protocol/' go.mod \
+            | awk '{print $2}' \
+            | while read -r r; do
+                echo "::notice::stripping dev-replace: ${r}"
+                go mod edit -dropreplace="${r}"
+              done
+
           go mod edit -require="${UP}@${VER}"
           go mod tidy
 
           # Idempotency: if the bump produced no diff, we already pin
-          # this version. Exit with code 78 (skip) so subsequent steps
-          # don't try to tag.
+          # this version. Exit with code 0 + skip flag so subsequent
+          # steps don't try to tag.
           if git diff --quiet go.mod go.sum; then
             echo "::notice::no go.mod changes — idempotent skip"
             echo "skip=1" >> "$GITHUB_OUTPUT"
