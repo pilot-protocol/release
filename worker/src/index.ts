@@ -233,6 +233,25 @@ async function serveCascadeStatus(env: Env, ctx: ExecutionContext): Promise<Resp
 // helpers
 // ---------------------------------------------------------------------------
 
+// fetchFileContent returns the UTF-8 text content of <path> in <repo>
+// at <ref>. Returns null on any failure (file missing, binary, oversize
+// for the API). Used by the changelog endpoint to give the LLM the
+// surrounding code, not just the diff hunk.
+async function fetchFileContent(env: Env, repo: string, path: string, ref: string): Promise<string | null> {
+  try {
+    const res: any = await ghAPI(env, `repos/${repo}/contents/${encodeURI(path)}?ref=${encodeURIComponent(ref)}`)
+    if (!res || res.type !== 'file') return null
+    if (res.encoding !== 'base64' || typeof res.content !== 'string') return null
+    const raw = res.content.replace(/\n/g, '')
+    // atob decodes ascii safely; for UTF-8 multibyte we'd need TextDecoder
+    // — but a brief peek + decode covers most source files.
+    const bytes = Uint8Array.from(atob(raw), c => c.charCodeAt(0))
+    return new TextDecoder('utf-8').decode(bytes)
+  } catch {
+    return null
+  }
+}
+
 async function ghAPI(env: Env, path: string): Promise<any> {
   const res = await fetch(`https://api.github.com/${path}`, {
     headers: {
@@ -371,26 +390,81 @@ async function serveChangelog(req: Request, env: Env, _ctx: ExecutionContext): P
     return json(result, 200)
   }
 
-  // --- 6. Build prompt with actual file diffs -----------------------------
-  // Bound the prompt size: top 8 commits (by their own metadata) and top
-  // 8 files (by additions+deletions), each file's patch capped at 1500
-  // chars. Plenty of context for a 70B model with 128K window.
-  const commitBlock = commits.slice(0, 8).map((c: any) => {
-    const subj = (c.commit.message || '').split('\n')[0].slice(0, 200)
-    const sha = (c.sha || '').slice(0, 7)
-    return `- ${subj} (${sha})`
-  }).join('\n')
+  // --- 6. Build prompt with diffs + full file contents --------------------
+  // The LLM needs to understand WHAT THE CODE DOES, not just what lines
+  // moved. For the top N most-changed files we attach both:
+  //   (a) the diff hunk
+  //   (b) the file's full content at HEAD
+  //
+  // Llama 3.3 70B has a 128K context window. ≈4 chars per token gives
+  // ~384K chars of input budget. Targets:
+  //   - up to 30 commits (full message bodies, capped at 800 chars each)
+  //   - up to 12 files with FULL contents (capped at 12K chars each)
+  //     and their diffs (capped at 4K chars each)
+  //   - leaves ~140K chars of budget for the system prompt + safety margin
+  const MAX_COMMITS = 30
+  const MAX_FILES_FULL = 12
+  const MAX_PATCH_CHARS = 4000
+  const MAX_FILE_CHARS = 12_000
 
-  const fileDiffs = files
+  const commitBlock = commits.slice(0, MAX_COMMITS).map((c: any) => {
+    const msg = (c.commit?.message || '').trim()
+    const sha = (c.sha || '').slice(0, 7)
+    const trimmed = msg.length > 800 ? msg.slice(0, 800) + '\n[…]' : msg
+    return `### commit ${sha}\n${trimmed}`
+  }).join('\n\n')
+
+  // Pick the most-churned files and skip generated / binary noise.
+  const concerning = files
+    .filter((f: any) => {
+      const name = (f.filename || '').toLowerCase()
+      // Skip likely-generated files; we want hand-written source for context.
+      if (/(^|\/)(go\.sum|package-lock\.json|yarn\.lock|cargo\.lock|pnpm-lock\.yaml)$/.test(name)) return false
+      if (/\.(svg|png|jpg|jpeg|gif|webp|ico|woff2?|ttf)$/.test(name)) return false
+      if (f.status === 'removed') return false  // can't fetch HEAD of a deleted file
+      return true
+    })
     .slice()
     .sort((a: any, b: any) => (b.additions + b.deletions) - (a.additions + a.deletions))
-    .slice(0, 8)
-    .map((f: any) => {
-      let patch = (f.patch || '').toString()
-      if (patch.length > 1500) patch = patch.slice(0, 1500) + '\n... [truncated]'
-      return `### ${f.filename}  (+${f.additions} −${f.deletions})\n\`\`\`diff\n${patch || '(binary or rename-only)'}\n\`\`\``
-    })
-    .join('\n\n')
+    .slice(0, MAX_FILES_FULL)
+
+  // Fetch the full content of each concerning file at the new HEAD. The
+  // ref we want is the upstream tag (for cascade summaries) or the
+  // receiver's own tag (for direct releases).
+  const contentRepo = upstreamRepo ?? body.repo
+  const contentRef = body.upstream_version ?? body.tag
+  const fileContents = await Promise.all(concerning.map(async (f: any) => ({
+    file: f,
+    content: await fetchFileContent(env, contentRepo, f.filename, contentRef),
+  })))
+
+  const fileSection = fileContents.map(({ file, content }) => {
+    let patch = (file.patch || '').toString()
+    if (patch.length > MAX_PATCH_CHARS) {
+      patch = patch.slice(0, MAX_PATCH_CHARS)
+        + `\n... [diff truncated; ${file.additions + file.deletions} total lines changed]`
+    }
+
+    let fullBody = content
+    if (fullBody && fullBody.length > MAX_FILE_CHARS) {
+      fullBody = fullBody.slice(0, MAX_FILE_CHARS) + '\n\n// [file content truncated]'
+    }
+
+    return `## ${file.filename}  (+${file.additions} −${file.deletions}, status=${file.status})
+
+### diff
+\`\`\`diff
+${patch || '(no inline patch available — likely a rename or large binary)'}
+\`\`\`
+
+### current file content (post-change)
+\`\`\`
+${fullBody ?? '(content unavailable)'}
+\`\`\``
+  }).join('\n\n---\n\n')
+
+  // Compatibility alias for the prompt template below.
+  const fileDiffs = fileSection
 
   const upstreamRange = upstreamRepo && prevUpstream
     ? `${upstreamRepo} ${prevUpstream}…${body.upstream_version}`
@@ -400,16 +474,23 @@ async function serveChangelog(req: Request, env: Env, _ctx: ExecutionContext): P
     ? `${body.repo} ${body.tag} is an auto-cascade bump that pins ${body.upstream_pkg}@${body.upstream_version}.`
     : `${body.repo} ${body.tag} is a direct release.`
 
-  const prompt = `You write factual release summaries for a Go-based overlay network project.
+  const prompt = `You are writing a release summary for a Go-based overlay network project. Read everything below carefully — you have BOTH the diff and the post-change file contents for each concerning file. Use the file contents to understand what the changed code actually does, not just which lines moved.
 
-Output: ONE paragraph, 1–3 sentences, maximum 60 words. No bullet lists, no markdown headings, no marketing words. Start with a verb describing what changed (e.g. "Adds…", "Fixes…", "Removes…"). Do NOT restate version numbers; do NOT say "this release". Identify the user-facing impact when possible. If the commits are purely cosmetic ("smoke test", "trigger docs", etc.), say plainly that the bump is administrative.
+Output rules:
+- ONE paragraph, 1–3 sentences, maximum 60 words.
+- Plain prose. No bullets, no markdown headings, no emojis, no marketing words.
+- Start with a verb describing what changed (Adds, Fixes, Removes, Renames, Decouples, etc.).
+- Do NOT restate version numbers or say "this release".
+- Identify the user-facing impact when the diff supports it.
+- If commits are clearly administrative (smoke test, docs bump, dependency rebase with no behavioral change), say so plainly.
+- If you cannot tell what changed from the materials provided, say "Trivial change; inspect the diff."
 
 ${context}${upstreamRange ? `\nDiff scope: ${upstreamRange}` : ''}
 
 Commits:
 ${commitBlock || '(none)'}
 
-File diffs (top by churn):
+Concerning files (diff + post-change content):
 ${fileDiffs || '(no file-level diff available)'}
 
 Summary:`
