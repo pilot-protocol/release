@@ -78,7 +78,7 @@ jobs:
             --policy policy.json \
             --output /tmp/closure.json
           cat /tmp/closure.json
-          jq -r '.targets[] | "  " + .repo + " (depth=" + (.depth|tostring) + ", zone=" + .zone + ")"' /tmp/closure.json
+          jq -r '.targets[] | "  " + .repo + " (depth=" + (.depth|tostring) + ", zone=" + (.zone|tostring) + ")"' /tmp/closure.json
 
       - name: Dispatch in waves
         if: inputs.dry_run != 'true'
