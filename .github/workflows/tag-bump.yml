@@ -67,17 +67,30 @@ jobs:
           UP: ${{ inputs.upstream }}
           VER: ${{ inputs.version }}
         run: |
-          # Strip any `replace github.com/pilot-protocol/...` lines
-          # that live in main. These are local-dev artifacts that
-          # point at ../sibling paths which CI doesn't have. With
-          # them present, `go mod tidy` fails to resolve. Without
-          # them, go uses the real published version, which is what
-          # production should always use anyway.
-          grep -E '^replace[[:space:]]+github\.com/pilot-protocol/' go.mod \
+          # Strip any `replace github.com/pilot-protocol/...` or
+          # `replace github.com/TeoSlayer/pilotprotocol...` lines.
+          # These are local-dev artifacts that point at ../sibling
+          # paths which CI doesn't have. With them present, `go mod
+          # tidy` fails to resolve. Without them, go uses the real
+          # published version — which is what production should
+          # always use anyway. Also drops any TeoSlayer require
+          # entries left over from the pre-migration era.
+          grep -E '^replace[[:space:]]+github\.com/(pilot-protocol/|TeoSlayer/)' go.mod \
             | awk '{print $2}' \
             | while read -r r; do
                 echo "::notice::stripping dev-replace: ${r}"
                 go mod edit -dropreplace="${r}"
+              done
+
+          # Drop TeoSlayer require entries — the migration to
+          # common/ made them unused; any straggler require lines
+          # pin to v0.0.0 (the pre-migration sentinel) and will not
+          # resolve from the proxy.
+          grep -E '^[[:space:]]*github\.com/TeoSlayer/pilotprotocol' go.mod \
+            | awk '{print $1}' \
+            | while read -r r; do
+                echo "::notice::dropping require: ${r}"
+                go mod edit -droprequire="${r}"
               done
 
           go mod edit -require="${UP}@${VER}"
