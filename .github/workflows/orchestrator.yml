@@ -39,12 +39,14 @@ on:
 permissions:
   contents: read
 
-# Per-(package, version) concurrency: a re-fire of the same release
-# within the dedupe window cancels the in-flight run rather than
-# stacking another dispatch wave.
+# PILOT-267: cancel-in-progress was false — a manual rerun while a
+# run was in flight would stack a second dispatch wave, so every
+# downstream got bumped twice and the cascade ended up with duplicate
+# tags + conflicting commits. Cancel the in-flight run instead so the
+# re-fire is the only active dispatcher for this (package, version).
 concurrency:
   group: cascade-${{ github.event.client_payload.package || inputs.package }}-${{ github.event.client_payload.version || inputs.version }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   fan-out:
@@ -116,8 +118,15 @@ jobs:
                 if [ "$HTTP_CODE" = "204" ]; then
                   echo "  ✓ ${repo} (zone=${zone})"
                 else
-                  echo "::warning::dispatch failed for ${repo}: HTTP ${HTTP_CODE}"
+                  # PILOT-257: 404 was previously a silent warning, so
+                  # the brew-tap cascade has been broken any time the
+                  # pilot-release-bot App is missing from a target's
+                  # owner (e.g. TeoSlayer/homebrew-pilot has never had
+                  # it installed). Fail loudly so it stops being silent.
+                  echo "::error::dispatch failed for ${repo}: HTTP ${HTTP_CODE}"
                   cat /tmp/resp
+                  echo "::error::cascade fan-out aborted at depth ${d} (target=${repo} zone=${zone})"
+                  exit 1
                 fi
               done
 
