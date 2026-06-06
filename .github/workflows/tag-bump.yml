@@ -71,13 +71,21 @@ jobs:
           UP: ${{ inputs.upstream }}
           VER: ${{ inputs.version }}
         run: |
-          # Strip any `replace github.com/pilot-protocol/...` lines
-          # — dev-time artifacts pointing at ../sibling paths which
-          # CI doesn't have. Without them, go uses the real published
-          # version, which is what production should always use.
-          grep -E '^replace[[:space:]]+github\.com/pilot-protocol/' go.mod \
-            | awk '{print $2}' \
-            | while read -r r; do
+          # PILOT-268: Strip any `replace github.com/pilot-protocol/...`
+          # entries — dev-time artifacts pointing at ../sibling paths
+          # which CI doesn't have. Without them, go uses the real
+          # published version, which is what production should always use.
+          #
+          # Use `go mod edit -json` instead of grepping go.mod so both the
+          # single-line form (`replace foo => ../foo`) AND the block form
+          # (`replace (\n foo => ../foo\n)`) get picked up. The previous
+          # `grep -E '^replace[[:space:]]'` regex missed the block form,
+          # which left replaces in place and broke `go mod tidy` on CI.
+          go mod edit -json | jq -r '
+            (.Replace // [])[]
+            | .Old.Path
+            | select(startswith("github.com/pilot-protocol/"))
+          ' | while read -r r; do
                 echo "::notice::stripping dev-replace: ${r}"
                 go mod edit -dropreplace="${r}"
               done
@@ -175,7 +183,11 @@ jobs:
             --arg uv "$VER" \
             '{repo:$r, tag:$t, upstream_pkg:$up, upstream_version:$uv}')
 
-          sig="sha256=$(printf '%s' "$body" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $NF}')"
+          # PILOT-258: compute HMAC via Python's hmac module so the secret
+          # never enters argv. The previous `openssl dgst -hmac "$SECRET"`
+          # put the secret in /proc/<pid>/cmdline for the duration of the
+          # call — every same-runner process could read it.
+          sig="sha256=$(SECRET="$SECRET" python3 -c 'import hmac,hashlib,os,sys; print(hmac.new(os.environ["SECRET"].encode(),sys.stdin.buffer.read(),hashlib.sha256).hexdigest())' <<< "$body")"
 
           # Tolerate worker errors — don't fail the whole tag run because
           # changelog generation glitched. Just skip the release body.
