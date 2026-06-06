@@ -175,7 +175,11 @@ jobs:
             --arg uv "$VER" \
             '{repo:$r, tag:$t, upstream_pkg:$up, upstream_version:$uv}')
 
-          sig="sha256=$(printf '%s' "$body" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $NF}')"
+          # PILOT-258: compute HMAC via Python's hmac module so the secret
+          # never enters argv. The previous `openssl dgst -hmac "$SECRET"`
+          # put the secret in /proc/<pid>/cmdline for the duration of the
+          # call — every same-runner process could read it.
+          sig="sha256=$(SECRET="$SECRET" python3 -c 'import hmac,hashlib,os,sys; print(hmac.new(os.environ["SECRET"].encode(),sys.stdin.buffer.read(),hashlib.sha256).hexdigest())' <<< "$body")"
 
           # Tolerate worker errors — don't fail the whole tag run because
           # changelog generation glitched. Just skip the release body.
