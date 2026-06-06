@@ -230,7 +230,14 @@ def reverse_closure(adj: dict[str, list[str]], root: str) -> list[tuple[str, int
                 depth[c] = depth[n] + 1
                 q.append(c)
     depth.pop(root, None)
-    return sorted(((n, d) for n, d in depth.items()), key=lambda x: (x[1], x[0]))
+    result = sorted(((n, d) for n, d in depth.items()), key=lambda x: (x[1], x[0]))
+    # PILOT-316: explicit defense-in-depth — root must never appear in the
+    # closure (it should have been removed by depth.pop above). If a
+    # future graph-construction bug introduces a back-edge to root, the
+    # BFS could re-add it and we'd cascade a release into itself.
+    assert root not in (n for n, _ in result), \
+        f"self-cascade: closure for {root!r} contains itself — graph has a back-edge"
+    return result
 
 
 def main() -> int:
