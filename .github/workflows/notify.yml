@@ -34,6 +34,15 @@ jobs:
           PKG: ${{ inputs.package }}
           VER: ${{ inputs.version || github.ref_name }}
         run: |
+          # PILOT-315: gate on strict semver so a maintainer pushing
+          # `v0.0.0-malicious` can't trigger the cascade. Allow optional
+          # pre-release suffix (-rc.1, -beta.2, -alpha.x.y) but require
+          # core `v<int>.<int>.<int>` shape and ban shell metachars.
+          if ! echo "$VER" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
+            echo "::error::version '$VER' does not match strict semver — refusing to dispatch"
+            exit 1
+          fi
+
           # Detect prerelease from the version suffix. The orchestrator
           # also re-validates this; defense in depth.
           IS_PRE=false
