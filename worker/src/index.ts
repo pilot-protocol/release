@@ -164,7 +164,11 @@ async function collectPlatforms(
   const out: Record<string, { url: string, sha256: string }> = {}
   if (!checksumsAsset) return out
 
-  const checksumsText = await fetch(checksumsAsset.browser_download_url).then(r => r.text())
+  // PILOT-329: AbortSignal.timeout caps outbound fetches so a slow GitHub
+  // response can't stall the Worker until Cloudflare's CPU budget kills it.
+  const checksumsText = await fetch(checksumsAsset.browser_download_url, {
+    signal: AbortSignal.timeout(5000),
+  }).then(r => r.text())
   // Format: "<sha256>  <filename>"
   for (const line of checksumsText.split('\n')) {
     const m = line.trim().match(/^([0-9a-f]{64})\s+(\S+)$/)
@@ -259,6 +263,9 @@ async function ghAPI(env: Env, path: string): Promise<any> {
       'accept':      'application/vnd.github+json',
       'authorization': `Bearer ${env.GH_TOKEN}`,
     },
+    // PILOT-329: cap outbound fetches so a slow GH response can't stall
+    // the Worker into Cloudflare's CPU-budget kill.
+    signal: AbortSignal.timeout(5000),
   })
   if (!res.ok) {
     throw new Error(`gh API ${path}: ${res.status} ${res.statusText}`)
