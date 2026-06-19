@@ -12,7 +12,7 @@ routes = [
 ]
 
 [vars]
-HUB_OWNER = "TeoSlayer"
+HUB_OWNER = "pilot-protocol"
 HUB_REPO  = "pilotprotocol"
 ORG       = "pilot-protocol"
 

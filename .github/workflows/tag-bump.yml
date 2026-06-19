@@ -90,13 +90,13 @@ jobs:
                 go mod edit -dropreplace="${r}"
               done
 
-          # Unconditionally drop the legacy TeoSlayer/pilotprotocol
+          # Unconditionally drop the legacy pilot-protocol/pilotprotocol
           # require + replace — pre-migration sentinels pinned to
           # v0.0.0 that never resolve from the proxy. go mod edit
           # is a no-op when the entry is absent, so safe.
           echo "::notice::dropping legacy TeoSlayer hub entries"
-          go mod edit -droprequire=github.com/TeoSlayer/pilotprotocol 2>/dev/null || true
-          go mod edit -dropreplace=github.com/TeoSlayer/pilotprotocol 2>/dev/null || true
+          go mod edit -droprequire=github.com/pilot-protocol/pilotprotocol 2>/dev/null || true
+          go mod edit -dropreplace=github.com/pilot-protocol/pilotprotocol 2>/dev/null || true
 
           go mod edit -require="${UP}@${VER}"
           go mod tidy
