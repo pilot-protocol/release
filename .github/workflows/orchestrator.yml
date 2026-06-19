@@ -13,7 +13,7 @@ name: orchestrator
 # group named after the tuple — concurrent runs supersede each other.
 #
 # Token: a GitHub App installation (RELEASE_APP) covers the entire
-# pilot-protocol org plus TeoSlayer/pilotprotocol. One app, one
+# pilot-protocol org plus pilot-protocol/pilotprotocol. One app, one
 # install, no per-repo secrets.
 
 on:
