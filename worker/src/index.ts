@@ -59,6 +59,20 @@ export default {
           return serveManifest(env, ctx, url)
         case '/.well-known/cascade-status.json':
           return serveCascadeStatus(env, ctx)
+        case '/.well-known/security.txt':
+          // This Worker owns the /.well-known/* route, so the Pages copy
+          // never serves. Keep the content here (it is 5 static lines).
+          return new Response(
+            [
+              'Contact: mailto:founders@pilotprotocol.network',
+              'Expires: 2027-07-08T00:00:00.000Z',
+              'Preferred-Languages: en',
+              'Canonical: https://pilotprotocol.network/.well-known/security.txt',
+              'Policy: https://pilotprotocol.network/docs/consent',
+              '',
+            ].join('\n'),
+            { headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'public, max-age=3600' } }
+          )
         case '/api/changelog':
           return serveChangelog(req, env, ctx)
         default:
