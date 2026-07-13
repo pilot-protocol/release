@@ -1,0 +1,120 @@
+name: release-watch
+
+# Pull-based cascade trigger — closes the sender gap in the release
+# fan-out.
+#
+# The push-based design (each sibling calls notify.yml on tag push)
+# was never wired: every zone repo got the cascade.yml RECEIVER but no
+# repo got the notify.yml SENDER, so `package-released` never fired and
+# the orchestrator only ever ran by hand (last: 2026-05-29; app-store
+# v1.0.1 on 2026-06-23 cascaded nowhere). Rather than provision an
+# ORCH_TOKEN secret into 20 sibling repos, this watcher follows the
+# same philosophy the distribution channels already use (see
+# pilotprotocol release.yml: homebrew / sdk-node / sdk-python all poll):
+# poll every producer repo's latest release, and for each unseen tag
+# fire the orchestrator via THIS repo's own workflow-dispatch — which
+# the built-in GITHUB_TOKEN is allowed to do. Zero cross-repo secrets.
+#
+# State lives in state/release-watch.json (node -> last dispatched
+# tag), committed back by the run. First run against a missing node
+# entry only RECORDS the current tag (no dispatch) so onboarding a
+# node never replays a stale release. The orchestrator's own
+# (package, version) dedupe is a second line of defense.
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # commit state/release-watch.json
+  actions: write    # gh workflow run orchestrator.yml (same repo)
+
+# One watcher at a time; a queued tick after a slow run is redundant.
+concurrency:
+  group: release-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan producer repos and fire cascade for new releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # Producer nodes: Go modules whose releases have downstream
+          # dependents. Distribution endpoints (homebrew-pilot, sdk-*)
+          # and zone-4 surfaces (website) are consumers, not producers —
+          # their cascades would compute empty closures, so they are not
+          # watched. Node name == repo name except the hub:
+          # web4 -> pilot-protocol/pilotprotocol.
+          NODES="common beacon gateway dataexchange eventstream handshake nameserver policy rendezvous runtime skillinject trustedagents updater webhook libpilot app-store examples cosift pilot-ca wallet web4"
+
+          STATE=state/release-watch.json
+          mkdir -p state
+          [ -f "$STATE" ] || echo '{}' > "$STATE"
+
+          CHANGED=0
+          for node in $NODES; do
+            repo="pilot-protocol/$node"
+            [ "$node" = "web4" ] && repo="pilot-protocol/pilotprotocol"
+
+            # Newest release including prereleases — /releases/latest
+            # hides betas, and zone-1 beta tags must cascade too (the
+            # receivers' stable_only gate decides what to do with them).
+            latest=$(gh api "repos/$repo/releases?per_page=1" --jq '.[0].tag_name // empty' 2>/dev/null || true)
+            [ -n "$latest" ] || continue
+
+            # Same strict-semver gate as notify.yml (PILOT-315).
+            if ! echo "$latest" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
+              echo "::warning::$node: tag '$latest' is not strict semver — skipping"
+              continue
+            fi
+
+            seen=$(jq -r --arg n "$node" '.[$n] // empty' "$STATE")
+
+            if [ -z "$seen" ]; then
+              # Never-watched node: record without dispatching so a
+              # fresh state file doesn't replay history.
+              echo "::notice::$node: seeding state at $latest (no dispatch)"
+              jq --arg n "$node" --arg v "$latest" '.[$n] = $v' "$STATE" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+              CHANGED=1
+              continue
+            fi
+
+            [ "$latest" = "$seen" ] && continue
+
+            IS_PRE=false
+            case "$latest" in
+              *-beta.*|*-rc.*|*-alpha.*|*-pre.*) IS_PRE=true ;;
+            esac
+
+            echo "::notice::$node: $seen -> $latest (prerelease=$IS_PRE) — firing orchestrator"
+            gh workflow run orchestrator.yml \
+              -f package="$node" \
+              -f version="$latest" \
+              -f is_prerelease="$IS_PRE" \
+              -f dry_run=false
+
+            jq --arg n "$node" --arg v "$latest" '.[$n] = $v' "$STATE" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+            CHANGED=1
+          done
+
+          if [ "$CHANGED" = "1" ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add "$STATE"
+            git commit -m "release-watch: update last-seen state [skip ci]"
+            # Rebase-push so two near-simultaneous runs (schedule +
+            # manual) don't clobber each other; concurrency group makes
+            # this a rare race anyway.
+            git pull --rebase origin "${GITHUB_REF_NAME:-main}"
+            git push origin "HEAD:${GITHUB_REF_NAME:-main}"
+          else
+            echo "no new releases"
+          fi
