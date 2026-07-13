@@ -54,7 +54,13 @@ jobs:
 
       - name: Scan producer repos and fire cascade for new releases
         env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
+          # Two tokens: the default token CAN dispatch same-repo
+          # workflows (actions: write below) but CANNOT push to
+          # protected main; the App token is the exact inverse
+          # (no actions permission on the installation, but a
+          # bypass allowance on main). Use each where it works.
+          GH_TOKEN: ${{ github.token }}
+          APP_TOKEN: ${{ steps.app.outputs.token }}
         run: |
           set -euo pipefail
 
@@ -120,7 +126,7 @@ jobs:
             git config user.name  "pilot-release-bot"
             git config user.email "release-bot@pilotprotocol.network"
             git config --local --unset-all http.https://github.com/.extraheader || true
-            git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+            git remote set-url origin "https://x-access-token:${APP_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
             git add "$STATE"
             git commit -m "release-watch: update last-seen state [skip ci]"
             # Rebase-push so two near-simultaneous runs (schedule +
