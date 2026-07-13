@@ -90,21 +90,18 @@ def parse_go_mod(text: str) -> dict:
 def module_to_node(mod_path: str, name_map: dict[str, str]) -> str | None:
     """Translate a Go import path into a node name. Returns None if
     the path is not a Pilot Protocol module."""
-    for prefix in ("github.com/pilot-protocol/", "github.com/TeoSlayer/"):
-        if mod_path.startswith(prefix):
-            tail = mod_path[len(prefix):]
-            top = tail.split("/", 1)[0]
-            if prefix.endswith("TeoSlayer/") and top == "pilotprotocol":
-                return name_map.get("__hub__")
-            return name_map.get(top)
+    prefix = "github.com/pilot-protocol/"
+    if mod_path.startswith(prefix):
+        top = mod_path[len(prefix):].split("/", 1)[0]
+        return name_map.get(top)
     return None
 
 
 def production_imports_hub(owner: str, repo: str, ref: str, candidate_files: list[str]) -> bool:
     """Best-effort heuristic: does any candidate prod file actually
-    import a TeoSlayer/pilotprotocol path? Used to drop the
-    test-only edge cycle-back to the hub."""
-    hub_paths = ("github.com/TeoSlayer/pilotprotocol", "github.com/pilot-protocol/web4")
+    import a hub path? Used to drop the test-only edge cycle-back
+    to the hub."""
+    hub_paths = ("github.com/pilot-protocol/web4",)
     for fp in candidate_files:
         src = fetch_file(owner, repo, ref, fp)
         if src and any(p in src for p in hub_paths):
@@ -121,7 +118,6 @@ def build_graph(org: str, hub: str, policy: dict) -> tuple[dict[str, list[str]],
     org_repos = list_org_repos(org)
     names = [r["name"] for r in org_repos]
     name_map = {n: n for n in names}
-    name_map["__hub__"] = "web4"
 
     hub_owner, hub_repo = hub.split("/", 1)
 
