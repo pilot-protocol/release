@@ -141,9 +141,14 @@ jobs:
         id: v
         if: steps.gate.outputs.skip != '1' && steps.bump.outputs.skip != '1'
         run: |
-          # Find the highest stable tag (no -beta / -rc / -alpha suffix).
+          # Highest STRICT-stable tag: exactly v<int>.<int>.<int>, no
+          # suffix. L3 fix: the old `grep -v -- '-(beta|rc|...)\.'`
+          # required a dot after the suffix, so a dotless prerelease
+          # (v1.0.0-rc1) slipped through as "stable" and blew up the
+          # arithmetic below (p="0-rc1"). Positive-match the canonical
+          # shape instead.
           stable=$(git tag -l 'v*' --sort=-v:refname \
-                   | grep -vE -- '-(beta|rc|alpha|pre)\.' | head -1)
+                   | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
           stable=${stable:-v0.0.0}
 
           # Target series is always the next patch of current stable.
@@ -255,60 +260,68 @@ jobs:
           REPO: ${{ github.repository }}
           SECRET: ${{ secrets.CHANGELOG_SECRET }}
         run: |
-          if [ -z "$SECRET" ]; then
-            echo "::notice::CHANGELOG_SECRET not provided; skipping auto-changelog"
-            exit 0
-          fi
-
           # Strip the github.com/<org>/ prefix so the upstream is just
           # the package name (e.g. "common").
           PKG="${UP##*/}"
 
-          body=$(jq -nc \
-            --arg r  "$REPO" \
-            --arg t  "$NEW_TAG" \
-            --arg up "$PKG" \
-            --arg uv "$VER" \
-            '{repo:$r, tag:$t, upstream_pkg:$up, upstream_version:$uv}')
+          # Best-effort LLM summary. A blank summary (secret absent, worker
+          # error, bad response) is NOT fatal — the release is created
+          # regardless (see below). This is the H1 fix: release-watch polls
+          # RELEASES, and tag-bump only produces a TAG; if the release were
+          # created only on changelog success (which never succeeded —
+          # H2), no auto-bump ever re-entered the cascade.
+          summary=""
+          if [ -n "$SECRET" ]; then
+            body=$(jq -nc \
+              --arg r  "$REPO" \
+              --arg t  "$NEW_TAG" \
+              --arg up "$PKG" \
+              --arg uv "$VER" \
+              '{repo:$r, tag:$t, upstream_pkg:$up, upstream_version:$uv}')
 
-          # PILOT-258: compute HMAC via Python's hmac module so the secret
-          # never enters argv. The previous `openssl dgst -hmac "$SECRET"`
-          # put the secret in /proc/<pid>/cmdline for the duration of the
-          # call — every same-runner process could read it.
-          sig="sha256=$(SECRET="$SECRET" python3 -c 'import hmac,hashlib,os,sys; print(hmac.new(os.environ["SECRET"].encode(),sys.stdin.buffer.read(),hashlib.sha256).hexdigest())' <<< "$body")"
+            # PILOT-258: HMAC via Python's hmac module so the secret never
+            # enters argv. H2 fix: sign the EXACT bytes curl sends —
+            # `printf '%s'`, not a `<<<` herestring, which appends a
+            # newline so the worker's HMAC(bodyText) never matched and
+            # every call 401'd.
+            sig="sha256=$(printf '%s' "$body" | SECRET="$SECRET" python3 -c 'import hmac,hashlib,os,sys; print(hmac.new(os.environ["SECRET"].encode(),sys.stdin.buffer.read(),hashlib.sha256).hexdigest())')"
 
-          # Tolerate worker errors — don't fail the whole tag run because
-          # changelog generation glitched. Just skip the release body.
-          resp=$(curl -fsS -X POST https://pilotprotocol.network/api/changelog \
-            -H "content-type: application/json" \
-            -H "x-signature: ${sig}" \
-            -d "$body" 2>/tmp/changelog-err) || {
+            if resp=$(curl -fsS -X POST https://pilotprotocol.network/api/changelog \
+                -H "content-type: application/json" \
+                -H "x-signature: ${sig}" \
+                -d "$body" 2>/tmp/changelog-err); then
+              s=$(echo "$resp" | jq -r '.summary // empty')
+              if [ -n "$s" ]; then
+                summary="$s"
+              else
+                echo "::warning::changelog response had no summary"
+              fi
+            else
               echo "::warning::changelog endpoint failed:"
               cat /tmp/changelog-err
-              exit 0
-            }
-
-          summary=$(echo "$resp" | jq -r .summary)
-          if [ -z "$summary" ] || [ "$summary" = "null" ]; then
-            echo "::warning::changelog response had no summary; skipping release body"
-            exit 0
+            fi
+          else
+            echo "::notice::CHANGELOG_SECRET not provided; release will use a plain body"
           fi
 
-          # Build the release body in a tmpfile so embedded blank lines
-          # don't trip the YAML block scalar.
+          # Build the release body. Falls back to a plain note when no LLM
+          # summary is available so the release is ALWAYS created.
           body_file=$(mktemp)
           {
-            printf '%s\n' "$summary"
-            printf '\n'
+            if [ -n "$summary" ]; then
+              printf '%s\n\n' "$summary"
+            else
+              printf 'Automated cascade bump of %s to %s.\n\n' "$PKG" "$VER"
+            fi
             printf -- '---\n'
             printf '*Auto-generated by pilot-release-bot — cascade origin: %s@%s*\n' "$UP" "$VER"
           } > "$body_file"
 
-          # If a release already exists (idempotent re-run), update it.
-          # --prerelease because tag-bump only ever produces -beta.* tags.
+          # Always create/update the release. --prerelease because
+          # tag-bump only ever produces -beta.* tags.
           if gh release view "$NEW_TAG" >/dev/null 2>&1; then
-            gh release edit "$NEW_TAG" --notes-file "$body_file"
+            gh release edit "$NEW_TAG" --notes-file "$body_file" --prerelease
           else
             gh release create "$NEW_TAG" --prerelease --title "$NEW_TAG" --notes-file "$body_file"
           fi
-          echo "::notice::posted release notes for ${NEW_TAG}"
+          echo "::notice::published release ${NEW_TAG} (llm_summary=$([ -n "$summary" ] && echo yes || echo no))"
