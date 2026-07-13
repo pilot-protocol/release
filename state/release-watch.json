@@ -6,14 +6,14 @@
   "eventstream": "v0.2.2-beta.1",
   "handshake": "v0.2.2",
   "nameserver": "v0.2.1-beta.2",
-  "policy": "v0.2.2",
+  "policy": "v0.2.3",
   "rendezvous": "v0.2.5",
-  "runtime": "v0.3.2-beta.1",
+  "runtime": "v0.3.2-beta.2",
   "skillinject": "v0.2.3",
   "trustedagents": "v0.2.4",
   "updater": "v0.2.3",
   "webhook": "v0.2.1-beta.1",
-  "libpilot": "v0.3.1-beta.1",
+  "libpilot": "v0.3.1-beta.2",
   "app-store": "v1.0.2",
   "examples": "v0.2.0",
   "cosift": "v0.1.0",
@@ -21,4 +21,3 @@
   "wallet": "v0.3.0-rc1",
   "web4": "v1.12.5"
 }
-
