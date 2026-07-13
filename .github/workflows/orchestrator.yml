@@ -83,7 +83,13 @@ jobs:
           jq -r '.targets[] | "  " + .repo + " (depth=" + (.depth|tostring) + ", zone=" + (.zone|tostring) + ")"' /tmp/closure.json
 
       - name: Dispatch in waves
-        if: inputs.dry_run != 'true'
+        # NOTE: dry_run is a type:boolean input, so it must be compared as
+        # a boolean. The previous `inputs.dry_run != 'true'` compared
+        # boolean-vs-string, which is always truthy in Actions expressions
+        # — dry runs dispatched for real (caught 2026-07-13 validating the
+        # web4 v1.12.5 cascade). On repository_dispatch events inputs is
+        # empty, so !inputs.dry_run stays true and the step runs.
+        if: ${{ !inputs.dry_run }}
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
           PKG: ${{ github.event.client_payload.package || inputs.package }}
@@ -97,10 +103,16 @@ jobs:
           # tagged + visible — no stale go.mod resolution.
           waves=$(jq -r '[.targets[].depth] | unique | sort | .[]' /tmp/closure.json)
 
+          rm -f /tmp/dispatch-failures
           for d in $waves; do
             echo "::group::Wave depth=$d"
-            jq -c ".targets[] | select(.depth == $d)" /tmp/closure.json \
-              | while read -r tgt; do
+            # mode=="poll" targets self-update by polling the upstream
+            # release (homebrew-pilot's update-formula.yml) — they need
+            # no dispatch, and TeoSlayer/* owners don't have the
+            # pilot-release-bot App installed anyway (guaranteed 403).
+            # Process substitution, not a pipe: the loop must run in
+            # this shell so the failure marker survives it.
+            while read -r tgt; do
                 repo=$(echo "$tgt"  | jq -r .repo)
                 zone=$(echo "$tgt"  | jq -r .zone)
                 payload=$(jq -nc \
@@ -118,17 +130,17 @@ jobs:
                 if [ "$HTTP_CODE" = "204" ]; then
                   echo "  ✓ ${repo} (zone=${zone})"
                 else
-                  # PILOT-257: 404 was previously a silent warning, so
-                  # the brew-tap cascade has been broken any time the
-                  # pilot-release-bot App is missing from a target's
-                  # owner (e.g. TeoSlayer/homebrew-pilot has never had
-                  # it installed). Fail loudly so it stops being silent.
-                  echo "::error::dispatch failed for ${repo}: HTTP ${HTTP_CODE}"
+                  # PILOT-257 made this loud instead of a silent warning.
+                  # But `exit 1` here aborted the ENTIRE cascade at the
+                  # first unreachable target (2026-07-13: the homebrew
+                  # 403 at depth 1 meant no other dependent ever got its
+                  # bump). Stay loud — error annotation + failed run —
+                  # without robbing every other target of its dispatch.
+                  echo "::error::dispatch failed for ${repo}: HTTP ${HTTP_CODE} (depth=${d} zone=${zone})"
                   cat /tmp/resp
-                  echo "::error::cascade fan-out aborted at depth ${d} (target=${repo} zone=${zone})"
-                  exit 1
+                  echo "${repo}" >> /tmp/dispatch-failures
                 fi
-              done
+              done < <(jq -c ".targets[] | select(.depth == $d) | select((.mode // \"auto\") != \"poll\")" /tmp/closure.json)
 
             # Best-effort wave barrier: give the dispatched workflows
             # 60s to start + ~2 min to finish a typical bump. The
@@ -137,3 +149,8 @@ jobs:
             sleep 90
             echo "::endgroup::"
           done
+
+          if [ -f /tmp/dispatch-failures ]; then
+            echo "::error::cascade completed with failed dispatches: $(paste -sd' ' /tmp/dispatch-failures)"
+            exit 1
+          fi
