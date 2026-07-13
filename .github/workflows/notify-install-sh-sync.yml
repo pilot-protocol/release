@@ -1,0 +1,41 @@
+name: notify-install-sh-sync
+
+# install.sh is the canonical installer, but the LIVE
+# pilotprotocol.network/install.sh is served by the pilot-release Worker
+# from R2 — a git merge here is invisible to users until the R2 object is
+# updated. The website repo's sync-install-sh.yml does that upload; this
+# workflow pokes it the instant install.sh changes on main, so a fix
+# reaches production in seconds instead of waiting for that repo's daily
+# cron. (The App token can POST repository_dispatch cross-repo — the same
+# mechanism the orchestrator uses for bump-upstream.)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - install.sh
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint App token
+        id: app
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: pilot-protocol
+          repositories: website
+
+      - name: Dispatch website sync-install-sh
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          gh api -X POST repos/pilot-protocol/website/dispatches \
+            -f event_type=release-install-sh-changed
+          echo "::notice::dispatched sync-install-sh to pilot-protocol/website"
