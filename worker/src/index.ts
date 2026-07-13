@@ -35,7 +35,7 @@ export interface Env {
 // allowlist is rejected — keeps the LLM from being used for arbitrary
 // repos and bounds the inferences-per-day burn.
 const ALLOWED_REPOS = new Set([
-  'TeoSlayer/pilotprotocol', 'TeoSlayer/homebrew-pilot',
+  'TeoSlayer/homebrew-pilot',
   'pilot-protocol/app-store', 'pilot-protocol/beacon',
   'pilot-protocol/common', 'pilot-protocol/dataexchange',
   'pilot-protocol/eventstream', 'pilot-protocol/gateway',
