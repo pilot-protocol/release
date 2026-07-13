@@ -178,19 +178,24 @@ jobs:
           fi
           echo "::notice::bump PR: ${PR_URL}"
 
-          # Auto-merge needs the repo setting; enable it idempotently.
-          gh api -X PATCH "repos/${GITHUB_REPOSITORY}" -F allow_auto_merge=true >/dev/null 2>&1 || true
-          gh pr merge "$BRANCH" --squash --auto --delete-branch
-
-          # Wait for auto-merge (the "test" check gates it). 20 min cap.
-          for i in $(seq 1 80); do
+          # The github-actions token cannot ENABLE auto-merge on a
+          # protected branch ("User is not authorized for this protected
+          # branch", 2026-07-13) — but it CAN merge outright once the
+          # required checks are green. So retry a plain squash-merge
+          # until the checks gate opens. 20 min cap.
+          MERGED=0
+          for i in $(seq 1 40); do
             STATE=$(gh pr view "$BRANCH" --json state --jq .state)
-            [ "$STATE" = "MERGED" ] && break
             [ "$STATE" = "CLOSED" ] && { echo "::error::bump PR closed without merge"; exit 1; }
-            sleep 15
+            [ "$STATE" = "MERGED" ] && { MERGED=1; break; }
+            if gh pr merge "$BRANCH" --squash --delete-branch 2>/tmp/merge-err; then
+              MERGED=1; break
+            fi
+            sleep 30
           done
-          if [ "$STATE" != "MERGED" ]; then
+          if [ "$MERGED" != "1" ]; then
             echo "::error::bump PR did not merge within 20 min (checks stuck/failing): ${PR_URL}"
+            cat /tmp/merge-err 2>/dev/null
             exit 1
           fi
 
