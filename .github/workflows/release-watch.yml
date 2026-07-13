@@ -41,9 +41,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Mint App token
+        # The state commit pushes to this repo's protected main; the
+        # default token cannot (GH006, observed on the first scheduled
+        # run 2026-07-13 09:54). pilot-release-bot has a
+        # bypass_pull_request_allowances entry on main.
+        id: app
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
       - name: Scan producer repos and fire cascade for new releases
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app.outputs.token }}
         run: |
           set -euo pipefail
 
@@ -106,8 +117,10 @@ jobs:
           done
 
           if [ "$CHANGED" = "1" ]; then
-            git config user.name  "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git config user.name  "pilot-release-bot"
+            git config user.email "release-bot@pilotprotocol.network"
+            git config --local --unset-all http.https://github.com/.extraheader || true
+            git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
             git add "$STATE"
             git commit -m "release-watch: update last-seen state [skip ci]"
             # Rebase-push so two near-simultaneous runs (schedule +
