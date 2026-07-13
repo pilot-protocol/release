@@ -9,6 +9,11 @@ compatibility_flags = ["nodejs_compat"]
 routes = [
   { pattern = "pilotprotocol.network/install.sh", custom_domain = false },
   { pattern = "pilotprotocol.network/.well-known/*", custom_domain = false },
+  # /api/changelog was implemented in src/index.ts but never routed —
+  # requests fell through to the website worker (405), so every
+  # tag-bump auto-changelog since the feature shipped silently skipped
+  # (found 2026-07-13 when the first live cascade bumps landed).
+  { pattern = "pilotprotocol.network/api/*", custom_domain = false },
 ]
 
 [vars]
