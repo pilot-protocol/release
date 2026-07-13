@@ -215,9 +215,18 @@ jobs:
             STATE=$(gh pr view "$BRANCH" --json state --jq .state)
             [ "$STATE" = "CLOSED" ] && { echo "::error::bump PR closed without merge"; exit 1; }
             [ "$STATE" = "MERGED" ] && { MERGED=1; break; }
-            if gh pr merge "$BRANCH" --squash --delete-branch 2>/tmp/merge-err; then
+            # REST, not `gh pr merge`: the CLI's GraphQL mergePullRequest
+            # mutation rejects App installations with "base branch policy
+            # prohibits the merge" even when the PR is CLEAN and a plain
+            # user merge succeeds (observed webhook#20, 2026-07-13). The
+            # REST merge endpoint evaluates the same protection correctly.
+            PR_NUM="${PR_URL##*/}"
+            if gh api -X PUT "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUM}/merge" \
+                 -f merge_method=squash >/tmp/merge-out 2>/tmp/merge-err; then
+              git push origin --delete "$BRANCH" 2>/dev/null || true
               MERGED=1; break
             fi
+            echo "merge attempt $i: $(tr -d '\n' </tmp/merge-err | head -c 300)"
             sleep 30
           done
           if [ "$MERGED" != "1" ]; then
