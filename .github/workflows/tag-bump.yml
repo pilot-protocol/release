@@ -42,6 +42,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write   # bump lands via PR + auto-merge (protected mains)
 
 jobs:
   bump:
@@ -137,25 +138,59 @@ jobs:
           echo "::notice::computed next tag: ${new_tag}"
           echo "tag=${new_tag}" >> "$GITHUB_OUTPUT"
 
-      - name: Commit, tag, push
+      - name: Commit, PR, auto-merge, tag
         if: steps.gate.outputs.skip != '1' && steps.bump.outputs.skip != '1'
         env:
+          GH_TOKEN: ${{ github.token }}
           NEW_TAG: ${{ steps.v.outputs.tag }}
           UP: ${{ inputs.upstream }}
           VER: ${{ inputs.version }}
         run: |
+          # Every zone-1 repo protects main with require-PR (0 approvals)
+          # + the "test" status check, and the built-in github-actions app
+          # cannot be granted a bypass (classic allowances silently drop
+          # it; repo rulesets reject it). Direct pushes therefore NEVER
+          # worked — every historical auto-tag either failed or predates
+          # protection. Land the bump the way the protection wants:
+          # branch -> PR -> auto-merge once "test" passes -> tag the
+          # merge commit. Bonus: the bump is now validated by the repo's
+          # own CI before main moves, not just by this workflow's build.
           git config user.name  "pilot-release-bot"
           git config user.email "release-bot@pilotprotocol.network"
+          BRANCH="bump/$(echo "${UP##*/}" | tr -c 'a-zA-Z0-9.-' '-')-${VER}"
+          git checkout -b "$BRANCH"
           git add go.mod go.sum
           git commit -m "deps: bump ${UP} to ${VER}" \
                      -m "auto-tagged ${NEW_TAG}"
-          git tag "$NEW_TAG"
-          # --atomic: all refs land or none do. Without it, a branch
-          # protection rejecting HEAD:main still let the tag through,
-          # leaving dangling beta tags pointing at commits not on main
-          # (handshake v0.2.2-beta.1 / libpilot v0.3.1-beta.1, 2026-07-13).
-          git push --atomic origin HEAD:main "$NEW_TAG"
-          echo "::notice::pushed ${NEW_TAG} → cascade will fan out next"
+          git push -f origin "HEAD:${BRANCH}"
+
+          PR_URL=$(gh pr create --head "$BRANCH" --base main \
+            --title "deps: bump ${UP##*/} to ${VER} (auto-cascade ${NEW_TAG})" \
+            --body "Automated cascade bump from the release orchestrator. Tags ${NEW_TAG} on merge." \
+            2>/dev/null || gh pr view "$BRANCH" --json url --jq .url)
+          echo "::notice::bump PR: ${PR_URL}"
+
+          # Auto-merge needs the repo setting; enable it idempotently.
+          gh api -X PATCH "repos/${GITHUB_REPOSITORY}" -F allow_auto_merge=true >/dev/null 2>&1 || true
+          gh pr merge "$BRANCH" --squash --auto --delete-branch
+
+          # Wait for auto-merge (the "test" check gates it). 20 min cap.
+          for i in $(seq 1 80); do
+            STATE=$(gh pr view "$BRANCH" --json state --jq .state)
+            [ "$STATE" = "MERGED" ] && break
+            [ "$STATE" = "CLOSED" ] && { echo "::error::bump PR closed without merge"; exit 1; }
+            sleep 15
+          done
+          if [ "$STATE" != "MERGED" ]; then
+            echo "::error::bump PR did not merge within 20 min (checks stuck/failing): ${PR_URL}"
+            exit 1
+          fi
+
+          MERGE_SHA=$(gh pr view "$BRANCH" --json mergeCommit --jq .mergeCommit.oid)
+          git fetch origin main
+          git tag "$NEW_TAG" "$MERGE_SHA"
+          git push origin "$NEW_TAG"
+          echo "::notice::merged ${PR_URL} and tagged ${NEW_TAG} @ ${MERGE_SHA} → cascade will fan out next"
 
       - name: Auto-changelog + GitHub release
         # Asks pilotprotocol.network/api/changelog (Workers AI) for a
