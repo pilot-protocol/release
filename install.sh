@@ -8,24 +8,29 @@ set -e
 # Usage:
 #   Install:        curl -fsSL https://pilotprotocol.network/install.sh | sh
 #   Pin a version:  curl -fsSL https://pilotprotocol.network/install.sh | sh -s -- --version v1.10.5
-#   Edge channel:   curl -fsSL https://pilotprotocol.network/install.sh | sh -s -- --channel edge
+#   Beta channel:   curl -fsSL https://pilotprotocol.network/install.sh | sh -s -- --channel beta
 #   Uninstall:      curl -fsSL https://pilotprotocol.network/install.sh | sh -s uninstall
 #
 # Flags:
 #   --version <tag>    Install a specific tag. Warns when older than latest stable.
-#   --channel <name>   stable (default) or edge. Edge tracks the newest prerelease.
+#   --channel <name>   stable (default) or beta. `edge` is accepted as an alias
+#                      for beta (the newest prerelease channel). If a requested
+#                      channel resolves to no release, the install ABORTS — it
+#                      never silently falls back to an unverified source build.
 #   --yes / -y         Skip the older-version confirmation prompt.
 #   --no-warn          Suppress the older-version warning entirely.
 #
 # Legacy env vars (still honored, lower precedence than flags):
 #   PILOT_RELEASE_TAG=vX.Y.Z   Same as --version.
-#   PILOT_RC=1                 Same as --channel edge.
+#   PILOT_RC=1                 Same as --channel beta.
 #
 # WHAT THIS SCRIPT DOES (read before piping to sh):
 #   1. Detects OS/arch (Linux/Darwin × amd64/arm64)
 #   2. Resolves the latest release tag from github.com/pilot-protocol/pilotprotocol/releases
 #   3. Downloads the release tarball + checksums.txt from that release
-#   4. *** Verifies SHA-256 of the tarball against checksums.txt (aborts on mismatch) ***
+#   4. *** Verifies SHA-256 of the tarball against checksums.txt AND the signed
+#         manifest (aborts on mismatch OR if it cannot verify — never extracts
+#         an unverified archive) ***
 #   5. Extracts binaries to ~/.pilot/bin (per-user, NOT system-wide)
 #   6. Adds ~/.pilot/bin to PATH via your shell profile
 #   7. On Linux with sudo: installs systemd unit for the daemon + auto-updater
@@ -73,6 +78,35 @@ BEACON="${PILOT_BEACON:-34.71.57.205:9001}"
 PILOT_DIR="$HOME/.pilot"
 BIN_DIR="$PILOT_DIR/bin"
 
+# validate_safe LABEL VALUE EXTRA — abort if VALUE contains any character
+# outside [A-Za-z0-9] plus the punctuation in EXTRA. These values are
+# interpolated UNQUOTED into config.json, the sudo-tee'd systemd unit, and the
+# launchd plist; without this a value containing a quote, angle bracket,
+# newline, or space could break out of the JSON string, inject extra daemon
+# flags into a root-owned unit, or corrupt the plist. We reject rather than
+# escape so the failure is loud and the generated files stay simple. EXTRA must
+# keep '-' last so tr treats it literally, not as a range.
+validate_safe() {
+    _vs_label="$1"; _vs_val="$2"; _vs_extra="$3"
+    # Delete every allowed character; anything left is disallowed. A trailing
+    # space is appended before the delete so that $()'s trailing-newline
+    # stripping cannot hide a lone newline in the leftover (a newline is never
+    # an allowed character, so it must be caught). Space is likewise never
+    # allowed, so a clean value leaves exactly that single trailing space.
+    _vs_bad=$(printf '%s ' "$_vs_val" | tr -d "A-Za-z0-9${_vs_extra}")
+    if [ "$_vs_bad" != " " ]; then
+        echo "Error: ${_vs_label} contains unsupported characters." >&2
+        echo "       Value:   ${_vs_val}" >&2
+        echo "       Allowed: letters, digits, and these: ${_vs_extra}" >&2
+        exit 1
+    fi
+}
+
+# Registry/beacon are host:port endpoints — validate before they reach the
+# daemon command line in the systemd unit / plist.
+validate_safe "registry (PILOT_REGISTRY)" "$REGISTRY" ".:-"
+validate_safe "beacon (PILOT_BEACON)" "$BEACON" ".:-"
+
 # Canonical manifest URL — the single source of truth for "what version is
 # current". Republished by web4 release.yml on every tag. Override only for
 # testing PR-preview manifests.
@@ -119,11 +153,17 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# Validate channel value early so we fail fast.
+# Validate channel value early so we fail fast. `edge` is a back-compat alias
+# for `beta`: the manifest publishes channels.stable and channels.beta only, so
+# a literal `edge` lookup would resolve empty and (previously) silently fall
+# through to an unverified source build. Normalise it to `beta` here.
+if [ "$PILOT_REQUESTED_CHANNEL" = "edge" ]; then
+    PILOT_REQUESTED_CHANNEL="beta"
+fi
 if [ -n "$PILOT_REQUESTED_CHANNEL" ] \
    && [ "$PILOT_REQUESTED_CHANNEL" != "stable" ] \
-   && [ "$PILOT_REQUESTED_CHANNEL" != "edge" ]; then
-    echo "Error: --channel must be 'stable' or 'edge' (got: $PILOT_REQUESTED_CHANNEL)" >&2
+   && [ "$PILOT_REQUESTED_CHANNEL" != "beta" ]; then
+    echo "Error: --channel must be 'stable' or 'beta' (got: $PILOT_REQUESTED_CHANNEL)" >&2
     exit 2
 fi
 
@@ -167,6 +207,19 @@ manifest_field() {
               | sed -E "s/.*\"${_mf_field}\"[[:space:]]*:[[:space:]]*\"([^\"]*)\".*/\\1/"
             ;;
     esac
+}
+
+# manifest_platform_sha256 "<os>-<arch>" "<file>" extracts the per-platform
+# sha256 from the manifest's "platforms" map, e.g. the hash inside
+#   "platforms": { "darwin-arm64": { "url": "...", "sha256": "abc..." } }
+# Returns empty if the platform block or its sha256 is absent. This is a second,
+# independent integrity anchor (served from pilotprotocol.network) alongside the
+# release's checksums.txt (served from GitHub).
+manifest_platform_sha256() {
+    _mp_plat="$1"; _mp_file="$2"
+    sed -n "/\"${_mp_plat}\"[[:space:]]*:[[:space:]]*{/,/}/p" "$_mp_file" \
+      | grep '"sha256"' | head -1 \
+      | sed -E 's/.*"sha256"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/'
 }
 
 # version_compare a b emits -1 / 0 / 1 for a<b / a==b / a>b.
@@ -297,6 +350,22 @@ if [ -z "$EMAIL" ] && [ ! -x "$BIN_DIR/pilotctl" ]; then
     fi
 fi
 
+# The email is interpolated unquoted into config.json (a JSON string), the
+# systemd unit ExecStart, and the launchd plist. Reject anything that could
+# break out of those contexts (quotes, backslash, angle brackets, spaces,
+# newlines). Standard email punctuation is allowed. Empty is fine here — an
+# existing install without a new email keeps whatever it had.
+if [ -n "$EMAIL" ]; then
+    validate_safe "email (PILOT_EMAIL)" "$EMAIL" "@.+_%-"
+fi
+
+# PILOT_HOSTNAME becomes a `-hostname <value>` argument in the root-owned
+# systemd unit and the plist. A value with whitespace would inject additional
+# daemon flags; validate it to hostname-safe characters.
+if [ -n "${PILOT_HOSTNAME:-}" ]; then
+    validate_safe "hostname (PILOT_HOSTNAME)" "$PILOT_HOSTNAME" "._-"
+fi
+
 # --- Detect existing installation ---
 
 UPDATING=false
@@ -319,7 +388,7 @@ ARCHIVE="pilot-${OS}-${ARCH}.tar.gz"
 #   1. --version <tag>            explicit pin via flag
 #   2. PILOT_RELEASE_TAG env       legacy explicit pin (back-compat)
 #   3. --channel <name>            manifest channel lookup
-#   4. PILOT_RC=1 env              legacy "edge" channel (back-compat)
+#   4. PILOT_RC=1 env              legacy "beta" channel (back-compat)
 #   5. Manifest "latest_stable"    preferred for the default install
 #   6. GitHub /releases/latest redirect — fallback when the manifest host
 #      is unreachable. Unauthenticated CDN, not subject to the 60/hr
@@ -337,7 +406,7 @@ elif [ -n "${PILOT_RELEASE_TAG:-}" ]; then
 elif [ -n "$PILOT_REQUESTED_CHANNEL" ] && [ "$HAVE_MANIFEST" = "1" ]; then
     TAG=$(manifest_field "channels.${PILOT_REQUESTED_CHANNEL}" "$MANIFEST_FILE")
 elif [ "${PILOT_RC:-}" = "1" ] && [ "$HAVE_MANIFEST" = "1" ]; then
-    TAG=$(manifest_field "channels.edge" "$MANIFEST_FILE")
+    TAG=$(manifest_field "channels.beta" "$MANIFEST_FILE")
 elif [ "${PILOT_RC:-}" = "1" ]; then
     # Manifest unreachable; fall back to api.github.com for the newest tag.
     API_BODY="$TMPDIR/releases.json"
@@ -361,6 +430,32 @@ else
         | grep -i '^location:' \
         | sed -n 's|.*/releases/download/\([^/]*\)/.*|\1|p' \
         | tr -d '\r' | head -1)
+fi
+
+# Fail loudly if the user explicitly asked for a released version/channel but it
+# resolved to nothing. Silently dropping to the unpinned, UNVERIFIED source
+# build below would give the user a binary they never asked for, with none of
+# the provenance guarantees of a release. Only the fully-automatic default path
+# (no explicit request) is allowed to fall back to a source build.
+if [ -z "$TAG" ]; then
+    if [ -n "$PILOT_REQUESTED_VERSION" ]; then
+        echo "Error: requested version '$PILOT_REQUESTED_VERSION' could not be resolved to a release." >&2
+        exit 1
+    fi
+    if [ -n "${PILOT_RELEASE_TAG:-}" ]; then
+        echo "Error: PILOT_RELEASE_TAG='$PILOT_RELEASE_TAG' could not be resolved to a release." >&2
+        exit 1
+    fi
+    if [ -n "$PILOT_REQUESTED_CHANNEL" ]; then
+        echo "Error: channel '$PILOT_REQUESTED_CHANNEL' resolved to no release (manifest reachable: $HAVE_MANIFEST)." >&2
+        echo "       Refusing to fall back to an unverified source build for an explicit channel request." >&2
+        exit 1
+    fi
+    if [ "${PILOT_RC:-}" = "1" ]; then
+        echo "Error: the beta/prerelease channel resolved to no release." >&2
+        echo "       Refusing to fall back to an unverified source build for an explicit channel request." >&2
+        exit 1
+    fi
 fi
 
 # Warn when the resolved tag is older than the manifest's latest_stable.
@@ -394,28 +489,80 @@ if [ -n "$TAG" ]; then
     CHECKSUMS_URL="https://github.com/${REPO}/releases/download/${TAG}/checksums.txt"
     echo "Downloading ${TAG}..."
     if curl -fsSL "$URL" -o "$TMPDIR/$ARCHIVE" 2>/dev/null; then
-        # Verify SHA-256 against release checksums.txt when available
+        # --- Verify SHA-256 (fail closed) ---
+        # This block NEVER extracts an archive it could not verify. Two
+        # independent anchors are used:
+        #   EXPECTED_CKS  — from the release's checksums.txt (GitHub)
+        #   EXPECTED_MAN  — the per-platform sha256 in the signed manifest
+        #                   (pilotprotocol.network)
+        # When both are present they must AGREE (defends against a compromise
+        # of either single source). At least one must be present, a working
+        # SHA-256 tool must exist, and the computed hash must match — otherwise
+        # the install aborts. (Previously a missing checksums.txt, a missing
+        # archive line, or the absence of shasum/sha256sum silently extracted
+        # the archive UNVERIFIED.)
+        EXPECTED_CKS=""
         if curl -fsSL "$CHECKSUMS_URL" -o "$TMPDIR/checksums.txt" 2>/dev/null; then
-            EXPECTED=$(grep " ${ARCHIVE}\$" "$TMPDIR/checksums.txt" | awk '{print $1}')
-            if [ -n "$EXPECTED" ]; then
-                if command -v shasum >/dev/null 2>&1; then
-                    ACTUAL=$(shasum -a 256 "$TMPDIR/$ARCHIVE" | awk '{print $1}')
-                elif command -v sha256sum >/dev/null 2>&1; then
-                    ACTUAL=$(sha256sum "$TMPDIR/$ARCHIVE" | awk '{print $1}')
-                else
-                    ACTUAL=""
-                fi
-                if [ -n "$ACTUAL" ] && [ "$ACTUAL" != "$EXPECTED" ]; then
-                    echo "Error: checksum mismatch for ${ARCHIVE}"
-                    echo "  expected: $EXPECTED"
-                    echo "  actual:   $ACTUAL"
-                    exit 1
-                fi
-                [ -n "$ACTUAL" ] && echo "  Verified SHA-256"
-            fi
+            EXPECTED_CKS=$(grep " ${ARCHIVE}\$" "$TMPDIR/checksums.txt" | awk '{print $1}')
+        fi
+        EXPECTED_MAN=""
+        if [ "$HAVE_MANIFEST" = "1" ]; then
+            EXPECTED_MAN=$(manifest_platform_sha256 "${OS}-${ARCH}" "$MANIFEST_FILE")
+        fi
+
+        # Cross-check the two anchors when both are available.
+        if [ -n "$EXPECTED_CKS" ] && [ -n "$EXPECTED_MAN" ] \
+           && [ "$EXPECTED_CKS" != "$EXPECTED_MAN" ]; then
+            echo "Error: integrity anchors disagree for ${ARCHIVE}" >&2
+            echo "  checksums.txt: $EXPECTED_CKS" >&2
+            echo "  manifest:      $EXPECTED_MAN" >&2
+            echo "  Refusing to install." >&2
+            exit 1
+        fi
+
+        # Pick the expected hash (prefer checksums.txt; fall back to manifest).
+        EXPECTED="$EXPECTED_CKS"
+        [ -z "$EXPECTED" ] && EXPECTED="$EXPECTED_MAN"
+        if [ -z "$EXPECTED" ]; then
+            echo "Error: no SHA-256 available for ${ARCHIVE}." >&2
+            echo "  checksums.txt was missing/incomplete and the manifest carried no hash." >&2
+            echo "  Refusing to install an unverified binary." >&2
+            exit 1
+        fi
+
+        # Compute the actual hash; a missing tool is a hard failure, not a skip.
+        if command -v shasum >/dev/null 2>&1; then
+            ACTUAL=$(shasum -a 256 "$TMPDIR/$ARCHIVE" | awk '{print $1}')
+        elif command -v sha256sum >/dev/null 2>&1; then
+            ACTUAL=$(sha256sum "$TMPDIR/$ARCHIVE" | awk '{print $1}')
+        else
+            echo "Error: no SHA-256 tool (shasum or sha256sum) found." >&2
+            echo "  Cannot verify ${ARCHIVE}; refusing to install unverified." >&2
+            echo "  Install coreutils (sha256sum) or perl (shasum) and retry." >&2
+            exit 1
+        fi
+        if [ -z "$ACTUAL" ]; then
+            echo "Error: failed to compute SHA-256 of ${ARCHIVE}." >&2
+            exit 1
+        fi
+        if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "Error: checksum mismatch for ${ARCHIVE}" >&2
+            echo "  expected: $EXPECTED" >&2
+            echo "  actual:   $ACTUAL" >&2
+            exit 1
+        fi
+        if [ -n "$EXPECTED_CKS" ] && [ -n "$EXPECTED_MAN" ]; then
+            echo "  Verified SHA-256 (checksums.txt + manifest)"
+        elif [ -n "$EXPECTED_CKS" ]; then
+            echo "  Verified SHA-256 (checksums.txt)"
+        else
+            echo "  Verified SHA-256 (manifest)"
         fi
         tar -xzf "$TMPDIR/$ARCHIVE" -C "$TMPDIR" --strip-components=1
     else
+        # Archive download failed. Only the automatic default path may fall
+        # back to a source build; an explicit request already hard-failed
+        # above, so reaching here means no version/channel was pinned.
         TAG=""
     fi
 fi
@@ -525,6 +672,18 @@ cat > "$PILOT_DIR/config.json" <<CONF
 CONF
 
 echo "Config written to ${PILOT_DIR}/config.json"
+
+# Enable background auto-updates by default (opt-out). The install output and
+# the systemd/launchd units below promise the updater keeps binaries current;
+# the pilot-updater treats a MISSING control file as "disabled", so without
+# this a fresh node would run an updater that never applies anything. Written
+# only on a fresh install so an operator who later runs `pilotctl update
+# disable` is never silently re-enabled. Turn off any time with
+# `pilotctl update disable`.
+if [ ! -f "$PILOT_DIR/auto-update.json" ]; then
+    printf '{\n  "enabled": true\n}\n' > "$PILOT_DIR/auto-update.json"
+    echo "Auto-updates ENABLED (opt-out) — disable with: pilotctl update disable"
+fi
 
 # --- Set up system service ---
 
@@ -809,6 +968,16 @@ echo "  background updates, or disable entirely:"
 echo "    pilotctl skills set-mode auto      # always up to date"
 echo "    pilotctl skills set-mode manual    # install once, update on upgrade"
 echo "    pilotctl skills disable all        # remove skills, stop injection"
+echo ""
+echo "  AUTO-UPDATES (on by default)"
+echo "  The pilot-updater service checks GitHub for new stable releases and"
+echo "  installs them automatically. Every update is integrity-checked: the"
+echo "  release checksums are verified against a GitHub SLSA provenance"
+echo "  attestation (bound to the exact release tag) before anything is"
+echo "  replaced — an unverifiable update is refused, not applied."
+echo "    pilotctl update disable    # turn auto-updates off"
+echo "    pilotctl update enable     # turn them back on"
+echo "    pilotctl update status     # show current setting + version"
 echo ""
 echo "  To opt out of telemetry, broadcasts, or reviews, edit:"
 echo "    ${PILOT_DIR}/config.json"
