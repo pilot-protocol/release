@@ -157,17 +157,25 @@ jobs:
           # own CI before main moves, not just by this workflow's build.
           git config user.name  "pilot-release-bot"
           git config user.email "release-bot@pilotprotocol.network"
-          BRANCH="bump/$(echo "${UP##*/}" | tr -c 'a-zA-Z0-9.-' '-')-${VER}"
+          BRANCH="bump/$(printf '%s' "${UP##*/}" | tr -c 'a-zA-Z0-9.-' '-')-${VER}"
           git checkout -b "$BRANCH"
           git add go.mod go.sum
           git commit -m "deps: bump ${UP} to ${VER}" \
                      -m "auto-tagged ${NEW_TAG}"
           git push -f origin "HEAD:${BRANCH}"
 
-          PR_URL=$(gh pr create --head "$BRANCH" --base main \
+          # No stderr swallowing: if PR creation fails (e.g. the org's
+          # "Allow GitHub Actions to create pull requests" toggle is off),
+          # the error must be visible, not a cryptic "no pull requests
+          # found" from the view fallback (2026-07-13).
+          if ! PR_URL=$(gh pr create --head "$BRANCH" --base main \
             --title "deps: bump ${UP##*/} to ${VER} (auto-cascade ${NEW_TAG})" \
-            --body "Automated cascade bump from the release orchestrator. Tags ${NEW_TAG} on merge." \
-            2>/dev/null || gh pr view "$BRANCH" --json url --jq .url)
+            --body "Automated cascade bump from the release orchestrator. Tags ${NEW_TAG} on merge."); then
+            PR_URL=$(gh pr view "$BRANCH" --json url --jq .url) || {
+              echo "::error::could not create or find bump PR for ${BRANCH} — check the org setting 'Allow GitHub Actions to create and approve pull requests'"
+              exit 1
+            }
+          fi
           echo "::notice::bump PR: ${PR_URL}"
 
           # Auto-merge needs the repo setting; enable it idempotently.
