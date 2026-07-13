@@ -248,7 +248,7 @@ def main() -> int:
     ap.add_argument("--policy", default="policy.json")
     ap.add_argument("--output", default="-")
     ap.add_argument("--org", default="pilot-protocol")
-    ap.add_argument("--hub", default="TeoSlayer/pilotprotocol")
+    ap.add_argument("--hub", default="pilot-protocol/pilotprotocol")
     args = ap.parse_args()
 
     policy = {}
