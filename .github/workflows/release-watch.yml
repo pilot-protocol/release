@@ -121,7 +121,20 @@ jobs:
               *-beta.*|*-rc.*|*-alpha.*|*-pre.*) IS_PRE=true ;;
             esac
 
-            echo "::notice::$node: $seen -> $latest (prerelease=$IS_PRE) — firing orchestrator"
+            # Only STABLE tags drive the cascade. A beta tag is a cascade
+            # OUTPUT (tag-bump produces -beta.N), and every receiver is
+            # stable_only, so dispatching a beta upstream fans out only to
+            # get skipped everywhere — pure waste (one orchestrator run +
+            # N no-op dispatches per beta). Still advance state so the beta
+            # isn't re-detected next tick; just don't fire.
+            if [ "$IS_PRE" = "true" ]; then
+              echo "::notice::$node: $seen -> $latest is a prerelease — tracking, not cascading"
+              jq --arg n "$node" --arg v "$latest" '.[$n] = $v' "$STATE" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+              CHANGED=1
+              continue
+            fi
+
+            echo "::notice::$node: $seen -> $latest (stable) — firing orchestrator"
             gh workflow run orchestrator.yml \
               -f package="$node" \
               -f version="$latest" \
