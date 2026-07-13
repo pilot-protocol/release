@@ -25,7 +25,7 @@ export interface Env {
   GH_TOKEN: string
   ASSETS?: R2Bucket         // install.sh asset in R2
   AI?: Ai                   // Workers AI binding (llama-3.1-8b-instruct etc.)
-  HUB_OWNER: string         // "TeoSlayer"
+  HUB_OWNER: string         // "pilot-protocol"
   HUB_REPO: string          // "pilotprotocol"
   ORG: string               // "pilot-protocol"
   CHANGELOG_SECRET?: string // HMAC key shared with CI workflows
@@ -132,8 +132,14 @@ async function serveManifest(env: Env, ctx: ExecutionContext, _url: URL): Promis
     `repos/${env.HUB_OWNER}/${env.HUB_REPO}/releases?per_page=20`
   )
 
-  const stable = releases.find(r => !r.prerelease && !r.draft)
-  const beta   = releases.find(r => r.prerelease && !r.draft) ?? stable
+  // The hub's own version tags are v<major>.<minor>.<patch>[-suffix].
+  // A foreign release published on the hub (e.g. `cosift-v0.1.2`) must
+  // NOT be able to poison a channel — its asset URLs would 404 and the
+  // installer would fall through to building from source. Require the
+  // canonical shape before a release can define a channel (M6).
+  const isHubTag = (r: GHRelease) => /^v\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$/.test(r.tag_name)
+  const stable = releases.find(r => !r.prerelease && !r.draft && isHubTag(r))
+  const beta   = releases.find(r => r.prerelease && !r.draft && isHubTag(r)) ?? stable
 
   if (!stable) {
     return new Response(JSON.stringify({ error: 'no stable release' }), {
@@ -219,9 +225,15 @@ async function serveCascadeStatus(env: Env, ctx: ExecutionContext): Promise<Resp
       r.conclusion === 'failure' ? 'failed' :
       r.status === 'completed'   ? 'completed' :
       'in_progress'
+    // orchestrator sets run-name "cascade <pkg>@<version>" (see
+    // orchestrator.yml) so display_title carries the real package —
+    // the old parse split the bare workflow name and every entry read
+    // "orchestrator".
+    const dt = (r.display_title ?? '') as string
+    const m = dt.match(/^cascade\s+(\S+?)@(\S+)/)
     bucket[target].push({
-      package: r.display_title?.replace(/^cascade-/, '').split('-')[0] ?? '',
-      tag:     r.display_title ?? '',
+      package: m ? m[1] : (r.name ?? ''),
+      tag:     m ? m[2] : dt,
       status:  r.status,
       conclusion: r.conclusion,
       started: r.created_at,
@@ -441,11 +453,25 @@ async function serveChangelog(req: Request, env: Env, _ctx: ExecutionContext): P
   const MAX_PATCH_CHARS = 4000
   const MAX_FILE_CHARS = 12_000
 
+  // PILOT-260: defang the common prompt-injection levers. The model is
+  // told everything inside the data markers is data, never instructions,
+  // but redacting the obvious markers shrinks the attack surface for
+  // anyone landing crafted content. Hoisted to function scope so it also
+  // covers commit messages (M9: commitBlock was previously injected RAW,
+  // outside the DIFF/FILE markers — a crafted commit message in any
+  // allowlisted repo was a clean injection channel into published notes).
+  const sanitize = (s: string | null | undefined) =>
+    (s ?? '')
+      .replace(/\u0000/g, '')
+      .replace(/```/g, "'''")
+      .replace(/\bIGNORE (PREVIOUS|ALL|ABOVE) INSTRUCTIONS\b/gi, '[redacted]')
+      .replace(/\bSYSTEM:\s*/gi, '[redacted]: ')
+
   const commitBlock = commits.slice(0, MAX_COMMITS).map((c: any) => {
-    const msg = (c.commit?.message || '').trim()
+    const msg = sanitize((c.commit?.message || '').trim())
     const sha = (c.sha || '').slice(0, 7)
     const trimmed = msg.length > 800 ? msg.slice(0, 800) + '\n[…]' : msg
-    return `### commit ${sha}\n${trimmed}`
+    return `### commit ${sha}\n<<<COMMIT\n${trimmed}\nCOMMIT>>>`
   }).join('\n\n')
 
   // Pick the most-churned files and skip generated / binary noise.
@@ -483,17 +509,6 @@ async function serveChangelog(req: Request, env: Env, _ctx: ExecutionContext): P
     if (fullBody && fullBody.length > MAX_FILE_CHARS) {
       fullBody = fullBody.slice(0, MAX_FILE_CHARS) + '\n\n// [file content truncated]'
     }
-
-    // PILOT-260: defang the most common prompt-injection levers (the model
-    // is told below that anything inside the FILE blocks is data, never
-    // instructions, but redacting the obvious markers shrinks the attack
-    // surface for anyone landing crafted file contents in a PR).
-    const sanitize = (s: string | null | undefined) =>
-      (s ?? '')
-        .replace(/```/g, "'''")
-        .replace(/ /g, '')
-        .replace(/\bIGNORE (PREVIOUS|ALL|ABOVE) INSTRUCTIONS\b/gi, '[redacted]')
-        .replace(/\bSYSTEM:\s*/gi, '[redacted]: ')
 
     return `## ${file.filename}  (+${file.additions} −${file.deletions}, status=${file.status})
 
