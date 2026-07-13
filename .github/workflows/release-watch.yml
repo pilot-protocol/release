@@ -81,14 +81,18 @@ jobs:
             repo="pilot-protocol/$node"
             [ "$node" = "web4" ] && repo="pilot-protocol/pilotprotocol"
 
-            # Highest strict-semver release including prereleases.
-            # /releases/latest hides betas; per_page=1 returned only the
-            # newest-CREATED release, which misses a second release landing
-            # in the same tick and is wrong if an older version is
-            # re-released. Pull a page and pick the highest semver by
-            # version sort (M3).
-            latest=$(gh api "repos/$repo/releases?per_page=30" \
-                       --jq '.[].tag_name' 2>/dev/null \
+            # Poll TAGS, not releases. Zone-1 is the "tag-only" zone: the
+            # canonical producer signal is the git tag (the README:
+            # "downstream cascades trigger on tag push"). Polling releases
+            # missed every zone-1 producer, because their high stable tags
+            # (common v0.5.7, gateway v0.2.1, trustedagents v0.2.4, …) have
+            # no GitHub release — so the cascade dead-ended at depth 1 and
+            # existing pins never reconciled. Highest strict-semver tag,
+            # prereleases included (a beta upstream dispatches with
+            # is_prerelease=true and the receivers' stable_only gate
+            # decides). Sort -V, tail -1.
+            latest=$(gh api "repos/$repo/tags?per_page=100" \
+                       --jq '.[].name' 2>/dev/null \
                      | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$' \
                      | sort -V | tail -1 || true)
             [ -n "$latest" ] || continue
