@@ -81,10 +81,16 @@ jobs:
             repo="pilot-protocol/$node"
             [ "$node" = "web4" ] && repo="pilot-protocol/pilotprotocol"
 
-            # Newest release including prereleases — /releases/latest
-            # hides betas, and zone-1 beta tags must cascade too (the
-            # receivers' stable_only gate decides what to do with them).
-            latest=$(gh api "repos/$repo/releases?per_page=1" --jq '.[0].tag_name // empty' 2>/dev/null || true)
+            # Highest strict-semver release including prereleases.
+            # /releases/latest hides betas; per_page=1 returned only the
+            # newest-CREATED release, which misses a second release landing
+            # in the same tick and is wrong if an older version is
+            # re-released. Pull a page and pick the highest semver by
+            # version sort (M3).
+            latest=$(gh api "repos/$repo/releases?per_page=30" \
+                       --jq '.[].tag_name' 2>/dev/null \
+                     | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$' \
+                     | sort -V | tail -1 || true)
             [ -n "$latest" ] || continue
 
             # Same strict-semver gate as notify.yml (PILOT-315).
