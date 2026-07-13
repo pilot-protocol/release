@@ -39,6 +39,12 @@ on:
       CHANGELOG_SECRET:
         description: 'HMAC secret for pilotprotocol.network/api/changelog'
         required: false
+      RELEASE_APP_ID:
+        description: 'pilot-release-bot App ID — bump PRs created via App token so CI triggers'
+        required: false
+      RELEASE_APP_PRIVATE_KEY:
+        description: 'pilot-release-bot private key (org secret)'
+        required: false
 
 permissions:
   contents: write
@@ -47,9 +53,25 @@ permissions:
 jobs:
   bump:
     runs-on: ubuntu-latest
+    env:
+      HAS_APP: ${{ secrets.RELEASE_APP_ID != '' }}
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
+
+      - name: Mint App token
+        # PRs and pushes made with the default GITHUB_TOKEN never trigger
+        # workflows (GitHub recursion guard), so required checks on bump
+        # PRs would sit unreported forever. An App-minted token has no
+        # such restriction. Optional: falls back to github.token when the
+        # org secrets are not provided (bumps then need manual CI kicks).
+        id: app
+        if: env.HAS_APP == 'true'
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
 
       - uses: actions/setup-go@v5
         with: { go-version-file: go.mod }
@@ -141,7 +163,7 @@ jobs:
       - name: Commit, PR, auto-merge, tag
         if: steps.gate.outputs.skip != '1' && steps.bump.outputs.skip != '1'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
           NEW_TAG: ${{ steps.v.outputs.tag }}
           UP: ${{ inputs.upstream }}
           VER: ${{ inputs.version }}
@@ -157,6 +179,11 @@ jobs:
           # own CI before main moves, not just by this workflow's build.
           git config user.name  "pilot-release-bot"
           git config user.email "release-bot@pilotprotocol.network"
+          # Push/PR as the App when its token is present: checkout's
+          # persisted extraheader (github.token) would win over URL
+          # credentials, so drop it and re-point the remote.
+          git config --local --unset-all http.https://github.com/.extraheader || true
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           BRANCH="bump/$(printf '%s' "${UP##*/}" | tr -c 'a-zA-Z0-9.-' '-')-${VER}"
           git checkout -b "$BRANCH"
           git add go.mod go.sum

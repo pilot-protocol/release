@@ -36,6 +36,13 @@ on:
         required: false
         default: true
         type: boolean
+    secrets:
+      RELEASE_APP_ID:
+        description: 'pilot-release-bot App ID — coalesced PR created via App token so CI triggers'
+        required: false
+      RELEASE_APP_PRIVATE_KEY:
+        description: 'pilot-release-bot private key (org secret)'
+        required: false
 
 permissions:
   contents: write
@@ -44,9 +51,25 @@ permissions:
 jobs:
   bump:
     runs-on: ubuntu-latest
+    env:
+      HAS_APP: ${{ secrets.RELEASE_APP_ID != '' }}
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
+
+      - name: Mint App token
+        # PRs and pushes made with the default GITHUB_TOKEN never trigger
+        # workflows (GitHub recursion guard), so required checks on bump
+        # PRs would sit unreported forever. An App-minted token has no
+        # such restriction. Optional: falls back to github.token when the
+        # org secrets are not provided (bumps then need manual CI kicks).
+        id: app
+        if: env.HAS_APP == 'true'
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
 
       - uses: actions/setup-go@v5
         with: { go-version-file: go.mod }
@@ -65,7 +88,7 @@ jobs:
       - name: Coalesce into daily bump branch
         if: steps.gate.outputs.skip != '1'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
           UP: ${{ inputs.upstream }}
           VER: ${{ inputs.version }}
         run: |
@@ -100,6 +123,8 @@ jobs:
           git config user.email "release-bot@pilotprotocol.network"
           git add go.mod go.sum
           git commit -m "deps: bump ${UP} to ${VER}"
+          git config --local --unset-all http.https://github.com/.extraheader || true
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git push origin "$BRANCH"
 
           # Open the PR if one is not already open for this branch.
