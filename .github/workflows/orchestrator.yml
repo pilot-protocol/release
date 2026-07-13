@@ -1,5 +1,10 @@
 name: orchestrator
 
+# run-name carries the package + version so /.well-known/cascade-status.json
+# (and the Actions UI) show which cascade a run is, not a generic
+# "orchestrator". The worker parses "cascade <pkg>@<version>".
+run-name: cascade ${{ github.event.client_payload.package || inputs.package }}@${{ github.event.client_payload.version || inputs.version }}
+
 # Central release orchestrator. Receives `package-released` from any
 # sibling, computes the reverse-transitive closure from the live
 # dependency graph (built on-demand from each repo's go.mod), then
