@@ -103,6 +103,17 @@ jobs:
           # tagged + visible — no stale go.mod resolution.
           waves=$(jq -r '[.targets[].depth] | unique | sort | .[]' /tmp/closure.json)
 
+          # Receivers run `go get <upstream>@<version>`, so upstream must
+          # be the full module path, not the bare package name — bare
+          # names fail with 'malformed module path "app-store": missing
+          # dot in first path element' in every receiver (seen on the
+          # app-store v1.0.1 catch-up, 2026-07-13). Package names map
+          # 1:1 to org module paths; the hub is the one exception.
+          case "$PKG" in
+            web4) UP_MODULE="github.com/pilot-protocol/pilotprotocol" ;;
+            *)    UP_MODULE="github.com/pilot-protocol/${PKG}" ;;
+          esac
+
           rm -f /tmp/dispatch-failures
           for d in $waves; do
             echo "::group::Wave depth=$d"
@@ -116,7 +127,7 @@ jobs:
                 repo=$(echo "$tgt"  | jq -r .repo)
                 zone=$(echo "$tgt"  | jq -r .zone)
                 payload=$(jq -nc \
-                  --arg up "$PKG" --arg ver "$VER" --argjson pre "$PRE" \
+                  --arg up "$UP_MODULE" --arg ver "$VER" --argjson pre "$PRE" \
                   '{event_type: "bump-upstream",
                     client_payload: {upstream: $up, version: $ver, is_prerelease: $pre}}')
 
