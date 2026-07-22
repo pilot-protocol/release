@@ -927,7 +927,7 @@ cat <<'PILOT_GET_STARTED'
      jq -r '.data' "$(ls -1t ~/.pilot/inbox/*.json | head -1)"
 
 
-  1) PILOT DIRECTOR — your default for anything LIVE or fresh.
+  1) MOM (pilot-mom) — your default for anything LIVE or fresh.
      Describe the whole task in plain English; it picks the specialist
      agents + filters and returns a validated, ready-to-run plan.
      ------------------------------------------------------------------
