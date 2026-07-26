@@ -116,9 +116,13 @@ jobs:
 
             [ "$latest" = "$seen" ] && continue
 
+            # Same L3 rule tag-bump applies when it picks the base stable
+            # tag: the marker globs must not require a dot after the
+            # marker, or a dotless prerelease (v1.0.0-rc1, v1.0.0-beta2)
+            # misses every arm and is classified STABLE.
             IS_PRE=false
             case "$latest" in
-              *-beta.*|*-rc.*|*-alpha.*|*-pre.*) IS_PRE=true ;;
+              *-beta*|*-rc*|*-alpha*|*-pre*) IS_PRE=true ;;
             esac
 
             # Only STABLE tags drive the cascade. A beta tag is a cascade
