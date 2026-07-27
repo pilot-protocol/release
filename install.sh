@@ -7,7 +7,7 @@ set -e
 #
 # Usage:
 #   Install:        curl -fsSL https://pilotprotocol.network/install.sh | sh
-#   Pin a version:  curl -fsSL https://pilotprotocol.network/install.sh | sh -s -- --version v1.10.5
+#   Pin a version:  curl -fsSL https://pilotprotocol.network/install.sh | sh -s -- --version v1.13.6
 #   Beta channel:   curl -fsSL https://pilotprotocol.network/install.sh | sh -s -- --channel beta
 #   Uninstall:      curl -fsSL https://pilotprotocol.network/install.sh | sh -s uninstall
 #
@@ -36,9 +36,14 @@ set -e
 #         manifest (aborts on mismatch OR if it cannot verify — never extracts
 #         an unverified archive) ***
 #   5. Extracts binaries to ~/.pilot/bin (per-user, NOT system-wide)
-#   6. Adds ~/.pilot/bin to PATH via your shell profile
-#   7. On Linux with sudo: installs systemd unit for the daemon + auto-updater
-#   8. On macOS with sudo: installs LaunchDaemons for the daemon + auto-updater
+#   6. Adds ~/.pilot/bin to PATH in your shell profiles (~/.profile, ~/.bashrc,
+#      ~/.zshenv, ~/.zshrc, ~/.bash_profile when it already exists)
+#   7. Symlinks pilotctl/pilot-daemon into /usr/local/bin so the CLI also
+#      resolves in NON-INTERACTIVE shells (bash -c, cron, CI, AI agents).
+#      Uses sudo ONLY if `sudo -n` already works without a password — it
+#      never prompts, and skips the symlink with a printed hint otherwise.
+#   8. On Linux with sudo: installs systemd unit for the daemon + auto-updater
+#   9. On macOS with sudo: installs LaunchDaemons for the daemon + auto-updater
 #
 # IDENTITY & EMAIL (optional):
 #   - The daemon registers a stable Ed25519 keypair with a rendezvous server
@@ -61,8 +66,11 @@ set -e
 #   - Send any personal data anywhere (the install script only fetches the
 #     release tarball from GitHub; the daemon registers its public key + a
 #     synthetic or user-supplied email with the rendezvous server, nothing else)
-#   - Modify files outside $HOME/.pilot, /etc/systemd (Linux) or
-#     /Library/LaunchDaemons (macOS), and your shell profile
+#   - Modify files outside $HOME/.pilot, your shell profiles, the
+#     /usr/local/bin symlinks described above, /etc/systemd (Linux) or
+#     /Library/LaunchDaemons (macOS)
+#   - Prompt for a sudo password (sudo is used only when `sudo -n` already
+#     succeeds without one; otherwise every privileged step is skipped)
 #   - Require any account credential or signup to install
 #
 # Verifiable provenance:
@@ -261,11 +269,38 @@ if [ "${1}" = "uninstall" ]; then
     # Stop daemon
     if [ -x "$BIN_DIR/pilotctl" ]; then
         "$BIN_DIR/pilotctl" daemon stop 2>/dev/null || true
-        "$BIN_DIR/pilotctl" gateway stop 2>/dev/null || true
+        # Gateway is extras-only in the core CLI: plain `pilotctl gateway stop`
+        # hard-errors ("gateway commands are not in the core CLI"), so the
+        # gateway was never actually stopped on uninstall.
+        "$BIN_DIR/pilotctl" extras gateway stop 2>/dev/null || true
     elif command -v pilotctl >/dev/null 2>&1; then
         pilotctl daemon stop 2>/dev/null || true
-        pilotctl gateway stop 2>/dev/null || true
+        pilotctl extras gateway stop 2>/dev/null || true
     fi
+
+    # Remove the /usr/local/bin symlinks the installer creates. Without this a
+    # dangling `pilotctl` stays on the default PATH after uninstall and fails
+    # with a confusing "No such file or directory". Only ever unlinks a SYMLINK
+    # that actually points into this user's ~/.pilot/bin — an unrelated real
+    # file of the same name is left alone. Same `sudo -n` gate as install: no
+    # password prompt, skip silently when we cannot write.
+    UNLINK_DIR="/usr/local/bin"
+    UNLINK_SUDO=""
+    if [ ! -w "$UNLINK_DIR" ] && sudo -n true 2>/dev/null; then
+        UNLINK_SUDO="sudo"
+    fi
+    for _b in pilotctl pilot-daemon pilot-gateway pilot-updater; do
+        if [ -L "$UNLINK_DIR/$_b" ]; then
+            case "$(readlink "$UNLINK_DIR/$_b" 2>/dev/null)" in
+                "$BIN_DIR"/*)
+                    # shellcheck disable=SC2086 # "" or "sudo" — intentional split
+                    if $UNLINK_SUDO rm -f "$UNLINK_DIR/$_b" 2>/dev/null; then
+                        echo "  Removed ${UNLINK_DIR}/${_b}"
+                    fi
+                    ;;
+            esac
+        fi
+    done
 
     # Remove system services (daemon + updater)
     if [ "$OS" = "linux" ]; then
@@ -277,7 +312,11 @@ if [ "${1}" = "uninstall" ]; then
                     sudo rm -f "/etc/systemd/system/${svc}.service"
                 fi
             done
-            sudo systemctl daemon-reload
+            # Never let daemon-reload abort the uninstall under `set -e`: on a
+            # host with sudo but no systemd (container / WSL / CI) systemctl is
+            # missing or fails, and the abort left ~/.pilot in place after the
+            # user asked to uninstall. Matches the install-side handling below.
+            sudo systemctl daemon-reload 2>/dev/null || true
             echo "  Removed systemd services"
         else
             echo "  Skipped systemd removal (run with sudo to remove)"
@@ -643,15 +682,59 @@ chmod 755 "$BIN_DIR/pilot-daemon" "$BIN_DIR/pilotctl"
 [ -f "$BIN_DIR/pilot-gateway" ] && chmod 755 "$BIN_DIR/pilot-gateway"
 [ -f "$BIN_DIR/pilot-updater" ] && chmod 755 "$BIN_DIR/pilot-updater"
 
-# --- Symlink to /usr/local/bin if writable, otherwise skip ---
+# --- Symlink into /usr/local/bin so NON-INTERACTIVE shells can find pilotctl ---
+#
+# This symlink is the only thing that makes `pilotctl` resolve from a
+# non-interactive shell. `bash -c 'pilotctl version'` reads NEITHER ~/.bashrc
+# (bash skips it entirely for -c) NOR ~/.profile (login shells only), and
+# Debian/Ubuntu's stock ~/.bashrc returns early for non-interactive shells
+# anyway. So a PATH line in a shell rc file is invisible to scripts, cron, CI
+# and AI agents shelling out — which are this CLI's primary callers. A binary
+# on the default system PATH is visible to all of them.
+#
+# Escalation order (never prompts, never escalates beyond what this installer
+# already does elsewhere):
+#   1. write directly when /usr/local/bin is already writable
+#   2. `sudo -n` — the SAME passwordless-sudo gate the systemd block below
+#      uses. If sudo would prompt, we do not use it.
+#   3. give up and print the exact command for the user to run themselves.
 
 LINK_DIR="/usr/local/bin"
+LINK_SUDO=""
+LINK_OK=false
+
 if [ -d "$LINK_DIR" ] && [ -w "$LINK_DIR" ]; then
-    ln -sf "$BIN_DIR/pilot-daemon" "$LINK_DIR/pilot-daemon"
-    ln -sf "$BIN_DIR/pilotctl" "$LINK_DIR/pilotctl"
-    [ -f "$BIN_DIR/pilot-gateway" ] && ln -sf "$BIN_DIR/pilot-gateway" "$LINK_DIR/pilot-gateway"
-    [ -f "$BIN_DIR/pilot-updater" ] && ln -sf "$BIN_DIR/pilot-updater" "$LINK_DIR/pilot-updater"
-    echo "  Symlinked to ${LINK_DIR}"
+    LINK_OK=true
+elif sudo -n true 2>/dev/null; then
+    LINK_SUDO="sudo"
+    LINK_OK=true
+    if [ ! -d "$LINK_DIR" ]; then
+        sudo mkdir -p "$LINK_DIR" 2>/dev/null || LINK_OK=false
+    fi
+fi
+
+if [ "$LINK_OK" = true ]; then
+    # shellcheck disable=SC2086 # $LINK_SUDO is "" or "sudo" — intentional split
+    $LINK_SUDO ln -sf "$BIN_DIR/pilot-daemon" "$LINK_DIR/pilot-daemon" 2>/dev/null || LINK_OK=false
+    # shellcheck disable=SC2086
+    $LINK_SUDO ln -sf "$BIN_DIR/pilotctl" "$LINK_DIR/pilotctl" 2>/dev/null || LINK_OK=false
+    if [ -f "$BIN_DIR/pilot-gateway" ]; then
+        # shellcheck disable=SC2086
+        $LINK_SUDO ln -sf "$BIN_DIR/pilot-gateway" "$LINK_DIR/pilot-gateway" 2>/dev/null || true
+    fi
+    if [ -f "$BIN_DIR/pilot-updater" ]; then
+        # shellcheck disable=SC2086
+        $LINK_SUDO ln -sf "$BIN_DIR/pilot-updater" "$LINK_DIR/pilot-updater" 2>/dev/null || true
+    fi
+fi
+
+if [ "$LINK_OK" = true ]; then
+    if [ -n "$LINK_SUDO" ]; then
+        echo "  Symlinked to ${LINK_DIR} (via passwordless sudo)"
+    else
+        echo "  Symlinked to ${LINK_DIR}"
+    fi
+    echo "  pilotctl now resolves in non-interactive shells (bash -c, cron, CI, agents)"
 fi
 
 # --- Update: stop here, skip config/service/PATH setup ---
@@ -867,27 +950,67 @@ UPLIST
 fi
 
 # --- Add to PATH ---
+#
+# Writing to ONE rc file picked from $SHELL is not enough. The file that a
+# given shell reads depends on how it was started:
+#   ~/.profile       login sh/bash — sets PATH once for the whole session, so
+#                    every child process (including `bash -c`) inherits it
+#   ~/.bash_profile  bash login shells; when present it SHADOWS ~/.profile,
+#                    so we must append there too (but never create it — doing
+#                    so would newly shadow a working ~/.profile)
+#   ~/.bashrc        interactive bash only (Debian/Ubuntu's stock copy
+#                    `return`s immediately for non-interactive shells)
+#   ~/.zshenv        zsh — read for EVERY invocation, including `zsh -c`
+#   ~/.zshrc         interactive zsh
+# Together with the /usr/local/bin symlink above this covers login shells,
+# interactive shells and non-interactive shells.
 
-IN_PATH=false
-case ":$PATH:" in
-    *":${BIN_DIR}:"*) IN_PATH=true ;;
-esac
+PATH_FILES=""
 
-if [ "$IN_PATH" = false ]; then
-    SHELL_NAME=$(basename "$SHELL" 2>/dev/null || echo "sh")
-    case "$SHELL_NAME" in
-        zsh)  RC="$HOME/.zshrc" ;;
-        bash) RC="$HOME/.bashrc" ;;
-        *)    RC="$HOME/.profile" ;;
-    esac
-    if [ -f "$RC" ] && grep -q "$BIN_DIR" "$RC" 2>/dev/null; then
-        : # already in rc file
-    else
-        echo "" >> "$RC"
-        echo "# Pilot Protocol" >> "$RC"
-        echo "export PATH=\"${BIN_DIR}:\$PATH\"" >> "$RC"
-        echo "  Added ${BIN_DIR} to PATH in ${RC}"
+pilot_add_path() {
+    _ap_rc="$1"
+    if [ -e "$_ap_rc" ] && grep -qF "$BIN_DIR" "$_ap_rc" 2>/dev/null; then
+        return 0
     fi
+    {
+        echo ""
+        echo "# Pilot Protocol"
+        echo "export PATH=\"${BIN_DIR}:\$PATH\""
+    } >> "$_ap_rc" 2>/dev/null || return 1
+    PATH_FILES="${PATH_FILES}${PATH_FILES:+, }${_ap_rc}"
+    return 0
+}
+
+pilot_add_path "$HOME/.profile" || true
+if [ -f "$HOME/.bash_profile" ]; then
+    pilot_add_path "$HOME/.bash_profile" || true
+fi
+pilot_add_path "$HOME/.bashrc" || true
+if command -v zsh >/dev/null 2>&1 || [ -f "$HOME/.zshrc" ] || [ -f "$HOME/.zshenv" ]; then
+    # .zshenv is the only zsh file read by `zsh -c` (non-interactive).
+    pilot_add_path "$HOME/.zshenv" || true
+    if [ -f "$HOME/.zshrc" ]; then
+        pilot_add_path "$HOME/.zshrc" || true
+    fi
+fi
+
+if [ -n "$PATH_FILES" ]; then
+    echo "  Added ${BIN_DIR} to PATH in: ${PATH_FILES}"
+fi
+
+# If we could not put a binary on the default system PATH, say so loudly and
+# give the exact command — otherwise `bash -c 'pilotctl version'` keeps
+# failing for this user until they start a new login shell.
+if [ "$LINK_OK" != true ]; then
+    echo ""
+    echo "  NOTE: could not write ${LINK_DIR} (not writable, and no passwordless sudo)."
+    echo "        Shell profiles were updated, but non-interactive shells"
+    echo "        (bash -c '...', cron, CI, AI agents shelling out) will not see"
+    echo "        pilotctl until you start a new LOGIN shell. To fix it now:"
+    echo ""
+    echo "          sudo ln -sf ${BIN_DIR}/pilotctl     ${LINK_DIR}/pilotctl"
+    echo "          sudo ln -sf ${BIN_DIR}/pilot-daemon ${LINK_DIR}/pilot-daemon"
+    echo ""
 fi
 
 # --- Verify ---
@@ -914,17 +1037,22 @@ echo "  GET STARTED"
 echo ""
 echo "  0) Put pilotctl on your PATH and bring the node online."
 echo "     ------------------------------------------------------------------"
-echo "     export PATH=\"${BIN_DIR}:\$PATH\"   # if not restarting your shell"
+echo "     export PATH=\"${BIN_DIR}:\$PATH\"   # only needed in THIS shell, before you open a new one"
 cat <<'PILOT_GET_STARTED'
      pilotctl daemon start --hostname my-agent         # blocks until registered; email already saved
      pilotctl daemon status                            # confirm it's running
      pilotctl info                                      # node ID, address, peer count, uptime
 
      Reading any reply is always the same two-step idiom — send with
-     --wait, then read the newest inbox file's .data field:
+     --wait, then print the newest reply. No jq, no extra dependency:
      ------------------------------------------------------------------
      pilotctl send-message <agent> --data '<cmd>' --wait
-     jq -r '.data' "$(ls -1t ~/.pilot/inbox/*.json | head -1)"
+     pilotctl inbox --latest              # full body of the newest reply
+
+     # Other ways to read the inbox:
+     pilotctl inbox                       # 10 newest, one-line previews
+     pilotctl inbox --from pilot-mom --limit 3
+     pilotctl --json inbox --latest       # machine-readable envelope
 
 
   1) MOM (pilot-mom) — your default for anything LIVE or fresh.
@@ -932,7 +1060,7 @@ cat <<'PILOT_GET_STARTED'
      agents + filters and returns a validated, ready-to-run plan.
      ------------------------------------------------------------------
      pilotctl send-message pilot-mom --data 'current weather and air quality for Berlin' --wait
-     jq -r '.data' "$(ls -1t ~/.pilot/inbox/*.json | head -1)"
+     pilotctl inbox --latest
 
      # More examples — hand it the whole sentence, don't hunt for agents yourself:
      pilotctl send-message pilot-mom --data 'summarize this season F1 drivers' --wait
@@ -947,16 +1075,16 @@ cat <<'PILOT_GET_STARTED'
      ------------------------------------------------------------------
      # Browse the whole live catalogue:
      pilotctl send-message list-agents --data '/data' --wait
-     jq -r '.data' "$(ls -1t ~/.pilot/inbox/*.json | head -1)"
+     pilotctl inbox --latest
 
      # Search by keyword:
      pilotctl send-message list-agents --data '/data {"search":"bitcoin","limit":10}' --wait
-     jq -r '.data | fromjson' "$(ls -1t ~/.pilot/inbox/*.json | head -1)"
+     pilotctl inbox --latest
 
      # Learn a specialist's query schema, then query it with filters:
      pilotctl send-message <agent-name> --data '/help' --wait
      pilotctl send-message <agent-name> --data '/data {"<filter>":"<value>"}' --wait
-     jq -r '.data' "$(ls -1t ~/.pilot/inbox/*.json | head -1)"
+     pilotctl inbox --latest
 
 
 
@@ -1018,7 +1146,7 @@ echo ""
 if [ -f "$BIN_DIR/pilot-gateway" ]; then
     echo "Bridge IP traffic (requires root for ports < 1024):"
     echo ""
-    echo "  sudo ${BIN_DIR}/pilotctl gateway start --ports 80,3000 <pilot-addr>"
+    echo "  sudo ${BIN_DIR}/pilotctl extras gateway start --ports 80,3000 <pilot-addr>"
     echo "  curl http://10.4.0.1:3000/status"
     echo ""
 fi
