@@ -7,7 +7,7 @@ set -e
 #
 # Usage:
 #   Install:        curl -fsSL https://pilotprotocol.network/install.sh | sh
-#   Pin a version:  curl -fsSL https://pilotprotocol.network/install.sh | sh -s -- --version v1.10.5
+#   Pin a version:  curl -fsSL https://pilotprotocol.network/install.sh | sh -s -- --version v1.13.6
 #   Beta channel:   curl -fsSL https://pilotprotocol.network/install.sh | sh -s -- --channel beta
 #   Uninstall:      curl -fsSL https://pilotprotocol.network/install.sh | sh -s uninstall
 #
@@ -261,10 +261,13 @@ if [ "${1}" = "uninstall" ]; then
     # Stop daemon
     if [ -x "$BIN_DIR/pilotctl" ]; then
         "$BIN_DIR/pilotctl" daemon stop 2>/dev/null || true
-        "$BIN_DIR/pilotctl" gateway stop 2>/dev/null || true
+        # Gateway is extras-only in the core CLI: plain `pilotctl gateway stop`
+        # hard-errors ("gateway commands are not in the core CLI"), so the
+        # gateway was never actually stopped on uninstall.
+        "$BIN_DIR/pilotctl" extras gateway stop 2>/dev/null || true
     elif command -v pilotctl >/dev/null 2>&1; then
         pilotctl daemon stop 2>/dev/null || true
-        pilotctl gateway stop 2>/dev/null || true
+        pilotctl extras gateway stop 2>/dev/null || true
     fi
 
     # Remove system services (daemon + updater)
@@ -1018,7 +1021,7 @@ echo ""
 if [ -f "$BIN_DIR/pilot-gateway" ]; then
     echo "Bridge IP traffic (requires root for ports < 1024):"
     echo ""
-    echo "  sudo ${BIN_DIR}/pilotctl gateway start --ports 80,3000 <pilot-addr>"
+    echo "  sudo ${BIN_DIR}/pilotctl extras gateway start --ports 80,3000 <pilot-addr>"
     echo "  curl http://10.4.0.1:3000/status"
     echo ""
 fi
