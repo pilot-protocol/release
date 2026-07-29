@@ -7,17 +7,17 @@
   "handshake": "v0.2.7",
   "nameserver": "v0.2.2-beta.2",
   "policy": "v0.2.4-beta.2",
-  "rendezvous": "v0.2.8",
-  "runtime": "v0.3.2-beta.6",
+  "rendezvous": "v0.2.9-beta.1",
+  "runtime": "v0.3.3-beta.1",
   "skillinject": "v0.2.4-beta.2",
   "trustedagents": "v0.2.6-beta.2",
   "updater": "v0.2.4-beta.2",
-  "webhook": "v0.2.1-beta.6",
-  "libpilot": "v0.3.1-beta.12",
+  "webhook": "v0.2.1-beta.7",
+  "libpilot": "v0.3.1-beta.13",
   "app-store": "v1.0.2",
   "examples": "v0.2.0",
   "cosift": "v0.1.0",
   "pilot-ca": "v0.1.0",
   "wallet": "v0.3.0-rc1",
-  "web4": "v1.13.7"
+  "web4": "v1.13.8"
 }
