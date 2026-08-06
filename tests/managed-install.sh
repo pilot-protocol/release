@@ -46,17 +46,10 @@ chmod 755 "$FIXTURE/archive/daemon" "$FIXTURE/archive/pilotctl"
 COPYFILE_DISABLE=1 tar -czf "$FIXTURE/pilot-linux-amd64.tar.gz" -C "$FIXTURE/archive" .
 SHA=$(shasum -a 256 "$FIXTURE/pilot-linux-amd64.tar.gz" | awk '{print $1}')
 printf '%s  %s\n' "$SHA" pilot-linux-amd64.tar.gz > "$FIXTURE/checksums.txt"
-cat > "$FIXTURE/manifest.json" <<JSON
-{
-  "schema_version": 1,
-  "latest_stable": "managed-runtime-v9.9.9",
-  "platforms": {
-    "linux-amd64": {
-      "sha256": "$SHA"
-    }
-  }
-}
-JSON
+# Keep this intentionally compact and put another platform after linux-amd64.
+# The hosted authority emits compact JSON; the former line-range parser then
+# selected the final hash on the line instead of the requested platform.
+printf '%s\n' "{\"schema_version\":1,\"latest_stable\":\"managed-runtime-v9.9.9\",\"platforms\":{\"darwin-amd64\":{\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"darwin-arm64\":{\"sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"},\"linux-amd64\":{\"sha256\":\"$SHA\"},\"linux-arm64\":{\"sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}}}" > "$FIXTURE/manifest.json"
 cat > "$FIXTURE/stable-manifest.json" <<JSON
 {
   "schema_version": 1,
