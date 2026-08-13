@@ -132,6 +132,32 @@ fi
 grep -F 'PILOT_ENROLLMENT_TOKEN is required' "$WORK/missing.log" >/dev/null
 test ! -e "$MISSING_HOME/.pilot"
 
+# A second OS user must not silently take over the machine-wide daemon service
+# before its one-time enrollment token is claimed. The collision preflight must
+# fail before creating ~/.pilot or downloading a release.
+COLLISION_HOME="$WORK/collision-home"
+mkdir -p "$COLLISION_HOME"
+cat > "$FAKEBIN/systemctl" <<'SH'
+#!/bin/sh
+case "$*" in
+  "cat pilot-daemon")
+    printf '%s\n' '[Service]' 'ExecStart=/home/existing/.pilot/bin/pilot-daemon daemon start'
+    ;;
+  *) exit 1 ;;
+esac
+SH
+chmod 755 "$FAKEBIN/systemctl"
+if PATH="$FAKEBIN:$PATH" HOME="$COLLISION_HOME" PILOT_TEST_FIXTURE="$FIXTURE" \
+  PILOT_ENROLLMENT_TOKEN=unconsumed_collision_token \
+  sh "$ROOT/install.sh" --managed-url https://management.example > "$WORK/collision.log" 2>&1; then
+  echo 'managed install replaced another user machine-wide service' >&2
+  exit 1
+fi
+grep -F 'another Pilot node installation already owns machine-wide resources' "$WORK/collision.log" >/dev/null
+grep -F 'This enrollment token was not consumed' "$WORK/collision.log" >/dev/null
+test ! -e "$COLLISION_HOME/.pilot"
+rm -f "$FAKEBIN/systemctl"
+
 if PATH="$FAKEBIN:$PATH" HOME="$HOME_DIR" PILOT_TEST_FIXTURE="$FIXTURE" \
   PILOT_ENROLLMENT_TOKEN=second_token \
   sh "$ROOT/install.sh" --managed-url https://management.example > "$WORK/replay.log" 2>&1; then
