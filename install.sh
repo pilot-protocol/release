@@ -38,6 +38,8 @@ set -e
 #   PILOT_MANAGEMENT_URL=https://management.example
 #                              Same as --managed-url. Requires the one-time
 #                              PILOT_ENROLLMENT_TOKEN on first adoption.
+#   PILOT_ANALYTICS=0          Do not report this install. See INSTALL
+#                              ANALYTICS below. Default: on.
 #
 # WHAT THIS SCRIPT DOES (read before piping to sh):
 #   1. Detects OS/arch (Linux/Darwin × amd64/arm64)
@@ -55,6 +57,7 @@ set -e
 #      never prompts, and skips the symlink with a printed hint otherwise.
 #   8. On Linux with sudo: installs systemd unit for the daemon + auto-updater
 #   9. On macOS with sudo: installs LaunchDaemons for the daemon + auto-updater
+#  10. Reports the install once (see INSTALL ANALYTICS below)
 #
 # IDENTITY & EMAIL (optional):
 #   - The daemon registers a stable Ed25519 keypair with a rendezvous server
@@ -72,11 +75,35 @@ set -e
 #     `pilotctl set-email <addr>`. Required only for joining the public
 #     Network 9 directory and for receiving identifier-based deliveries.
 #
+# INSTALL ANALYTICS:
+#   - On a FIRST install only, this script generates a random `install_id`,
+#     writes it to ~/.pilot/install.json, and POSTs that file once to
+#     https://telemetry.pilotprotocol.network/v1/installs.
+#   - What is sent is exactly the contents of ~/.pilot/install.json — read it
+#     yourself after installing. It is: the random install_id, a timestamp,
+#     which entrypoint ran (curl-sh or managed), the release channel and tag,
+#     your OS/arch, and whether an existing install was replaced. No email, no
+#     hostname, no username, no key material, no directory paths.
+#   - The receiving server additionally records the country your request came
+#     from and a SALTED HASH of your IP address. It does not store the address.
+#   - Why it exists: it is the only way to tell how many installs become
+#     working nodes. The install_id is later reported once more by the daemon
+#     alongside its node id, which turns two anonymous counts into one number.
+#   - The POST is backgrounded with a 2-second cap and its failure is ignored.
+#     It cannot slow down, block, or fail your install.
+#   - Turn it off with PILOT_ANALYTICS=0 (or false/no/off). Nothing is
+#     generated and nothing is sent. Re-running the installer never re-reports.
+#   - Separately, the daemon's own telemetry is governed by
+#     `consent.telemetry` in ~/.pilot/config.json — see the end of this script.
+#
 # WHAT THIS SCRIPT DOES NOT DO:
 #   - Run as root (refuses if invoked as root; see check at line ~25)
-#   - Send any personal data anywhere (the install script only fetches the
-#     release tarball from GitHub; the daemon registers its public key + a
-#     synthetic or user-supplied email with the rendezvous server, nothing else)
+#   - Send any personal data anywhere. The script fetches the release tarball
+#     from GitHub and reports the install record described under INSTALL
+#     ANALYTICS above — a random id and build metadata, no personal data, and
+#     suppressed entirely by PILOT_ANALYTICS=0. The daemon separately
+#     registers its public key + a synthetic or user-supplied email with the
+#     rendezvous server, nothing else.
 #   - Modify files outside $HOME/.pilot, your shell profiles, the
 #     /usr/local/bin symlinks described above, /etc/systemd (Linux) or
 #     /Library/LaunchDaemons (macOS)
@@ -101,6 +128,20 @@ BEACON="${PILOT_BEACON:-34.71.57.205:9001}"
 PILOT_DIR="$HOME/.pilot"
 BIN_DIR="$PILOT_DIR/bin"
 MANAGED_CONTROL_PATH="$PILOT_DIR/managed/enterprise-control.json"
+
+# Install analytics. ON unless explicitly disabled with PILOT_ANALYTICS=0 (or
+# false/no/off). Anything else, including a malformed value, means on — the
+# same way common/consent treats an unparseable consent flag as true.
+#
+# Deliberately NOT a CLI flag: it must never appear in --help, never prompt,
+# and never gate the install. An install that cannot report is still a
+# completely successful install.
+ANALYTICS_ON=1
+case "$(printf '%s' "${PILOT_ANALYTICS:-1}" | tr '[:upper:]' '[:lower:]')" in
+    0|false|no|off) ANALYTICS_ON=0 ;;
+esac
+# Override only for testing against a staging ingest.
+ANALYTICS_URL="${PILOT_ANALYTICS_URL:-https://telemetry.pilotprotocol.network/v1/installs}"
 
 # validate_safe LABEL VALUE EXTRA — abort if VALUE contains any character
 # outside [A-Za-z0-9] plus the punctuation in EXTRA. These values are
@@ -1535,6 +1576,68 @@ fi
 
 # Write version file for the auto-updater
 [ -n "$TAG" ] && echo "$TAG" > "$BIN_DIR/.pilot-version"
+
+# --- Report the install (see INSTALL ANALYTICS in the header) ---
+#
+# Written once, on a genuine FIRST install. Re-running the installer is a
+# repair or an upgrade, not a new install: re-minting here would double-count
+# and would orphan the pair the daemon already reported under the old id. The
+# guard is on the FILE, matching the config.json / auto-update.json writes
+# above rather than $UPDATING — a host whose binaries were removed for a clean
+# reinstall keeps the identity it already reported.
+#
+# Nothing here is allowed to fail the install. Every step is guarded, the POST
+# is backgrounded with a hard 2s cap, and its exit status is discarded. A lost
+# report is always preferable to a blocked install, so the send is fire and
+# forget: on a very slow network the report is dropped rather than waited on.
+if [ "$ANALYTICS_ON" = "1" ] && [ -n "$TAG" ] && [ ! -f "$PILOT_DIR/install.json" ]; then
+    # 16 random bytes, hex. od is POSIX and present on both Linux and macOS;
+    # uuidgen and openssl are neither guaranteed nor portable enough to rely on.
+    INSTALL_ID=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' || true)
+    # Anything but 32 hex characters means /dev/urandom or od misbehaved. The
+    # server rejects a malformed id anyway; skip rather than send garbage.
+    case "$INSTALL_ID" in
+        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
+        *) INSTALL_ID="" ;;
+    esac
+
+    if [ -n "$INSTALL_ID" ]; then
+        if [ "$PILOT_MANAGED_MODE" = "1" ]; then
+            ANALYTICS_ENTRYPOINT="managed"
+        else
+            ANALYTICS_ENTRYPOINT="curl-sh"
+        fi
+        if [ "$UPDATING" = true ]; then
+            ANALYTICS_UPGRADE="true"
+        else
+            ANALYTICS_UPGRADE="false"
+        fi
+
+        # Every interpolated value is one this script derived itself: TAG comes
+        # from the signed manifest or a validated flag, OS/ARCH from the
+        # normalised case statements above, and the rest are literals. Nothing
+        # here is user-supplied free text.
+        cat > "$PILOT_DIR/install.json" <<IJSON
+{
+  "install_id": "${INSTALL_ID}",
+  "ts": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "entrypoint": "${ANALYTICS_ENTRYPOINT}",
+  "channel": "${PILOT_REQUESTED_CHANNEL:-stable}",
+  "tag": "${TAG}",
+  "platform": "${OS}/${ARCH}",
+  "upgrade": ${ANALYTICS_UPGRADE}
+}
+IJSON
+        chmod 600 "$PILOT_DIR/install.json" 2>/dev/null || true
+
+        # The file on disk IS the payload, so `cat ~/.pilot/install.json`
+        # answers "what did it send" exactly, with nothing to cross-check.
+        ( curl -fsS --max-time 2 -X POST \
+              -H 'content-type: application/json' \
+              --data-binary @"$PILOT_DIR/install.json" \
+              "$ANALYTICS_URL" >/dev/null 2>&1 || true ) &
+    fi
+fi
 
 if [ "$PILOT_MANAGED_MODE" = "1" ]; then
     echo ""
