@@ -14,7 +14,15 @@
 #   - no raw-IP registry/beacon is written for compat, or auto behind a proxy
 #     (an older pilotctl in compat mode gets the TLS registry by name);
 #   - a saved transport=auto is rewritten to udp for a daemon that predates it;
-#   - proxy credentials never reach the installer output or ~/.pilot.
+#   - proxy credentials never reach the installer output or ~/.pilot;
+#   - root reached through sudo/doas is refused, also without systemd;
+#   - a daemon that cannot use the proxy is never followed by an instruction
+#     to run `pilotctl daemon start` where the proxy is the way out, and a
+#     release without auto is not announced as auto (with the compat re-run
+#     for UDP-blocked hosts);
+#   - --version / --channel beta install a tag the manifest does not describe
+#     (checksums.txt is its anchor), while the manifest hash still has to
+#     agree for the tag it describes.
 #
 # Like tests/managed-install.sh it installs a fixture release through a fake
 # curl, so it needs no network. It never uses sudo (a fake sudo fails), and the
@@ -104,23 +112,54 @@ esac
 SH
 # The "old" pilotctl predates `daemon start --transport` (v1.13.x).
 sed 's/--transport <udp|compat|auto>/--registry <addr>/' "$FIXTURE/new/archive/pilotctl" > "$FIXTURE/old/archive/pilotctl"
-chmod 755 "$FIXTURE"/new/archive/* "$FIXTURE"/old/archive/*
+# An "ancient" daemon predates -transport altogether.
+mkdir -p "$FIXTURE/ancient/archive"
+cp "$FIXTURE/old/archive/pilotctl" "$FIXTURE/ancient/archive/pilotctl"
+cat > "$FIXTURE/ancient/archive/daemon" <<'SH'
+#!/bin/sh
+cat <<'HELP'
+Usage of pilot-daemon:
+  -registry string
+    	registry server address
+HELP
+exit 0
+SH
+chmod 755 "$FIXTURE"/new/archive/* "$FIXTURE"/old/archive/* "$FIXTURE"/ancient/archive/*
 
-make_release() { # make_release <dir> <tag>
+make_release() { # make_release <dir> <tag> [<beta tag> [<manifest sha256> [<platform url tag>]]]
     COPYFILE_DISABLE=1 tar -czf "$1/pilot-linux-amd64.tar.gz" -C "$1/archive" .
     _sha=$(shasum -a 256 "$1/pilot-linux-amd64.tar.gz" | awk '{print $1}')
     printf '%s  %s\n' "$_sha" pilot-linux-amd64.tar.gz > "$1/checksums.txt"
+    _url=""
+    if [ -n "${5:-}" ]; then
+        _url="\"url\": \"https://github.com/pilot-protocol/pilotprotocol/releases/download/$5/pilot-linux-amd64.tar.gz\", "
+    fi
     cat > "$1/stable-manifest.json" <<JSON
 {
   "schema_version": 1,
   "latest_stable": "$2",
-  "channels": {"stable": "$2", "beta": "$2"},
-  "platforms": {"linux-amd64": {"sha256": "$_sha"}}
+  "channels": {"stable": "$2", "beta": "${3:-$2}"},
+  "platforms": {"linux-amd64": {${_url}"sha256": "${4:-$_sha}"}}
 }
 JSON
 }
 make_release "$FIXTURE/new" v9.9.9
 make_release "$FIXTURE/old" v9.9.9
+make_release "$FIXTURE/ancient" v9.9.9
+# The live manifest's shape: it hashes latest_stable only (its platform url
+# names that tag); here that hash is not this archive's, like any other tag's.
+OTHER_SHA=0000000000000000000000000000000000000000000000000000000000000000
+mkdir -p "$FIXTURE/pinned"
+cp -R "$FIXTURE/new/archive" "$FIXTURE/pinned/archive"
+make_release "$FIXTURE/pinned" v9.9.9 v9.9.10-rc.1 "$OTHER_SHA" v9.9.9
+# The same without urls (a managed-runtime-style manifest): latest_stable only.
+mkdir -p "$FIXTURE/pinned-nourl"
+cp -R "$FIXTURE/new/archive" "$FIXTURE/pinned-nourl/archive"
+make_release "$FIXTURE/pinned-nourl" v9.9.9 v9.9.10-rc.1 "$OTHER_SHA"
+# A manifest whose url names the pinned tag: its hash must still agree.
+mkdir -p "$FIXTURE/pinned-named"
+cp -R "$FIXTURE/new/archive" "$FIXTURE/pinned-named/archive"
+make_release "$FIXTURE/pinned-named" v9.9.9 v9.9.10-rc.1 "$OTHER_SHA" v9.9.8
 
 # --- Fake system tools ----------------------------------------------------------
 
@@ -195,7 +234,15 @@ run_install() {
     mkdir -p "$_home"
     PATH="$FAKEBIN:$PATH" HOME="$_home" PILOT_TEST_RELEASE="$_rel" \
         PILOT_EMAIL=ci@example.com \
-        sh "$ROOT/install.sh" "$@" > "$LOG" 2>&1
+        "${PILOT_TEST_SH:-sh}" "$ROOT/install.sh" "$@" > "$LOG" 2>&1 </dev/null
+}
+
+# no_start_command <log> — the log never tells anyone to run the daemon start
+# command (a line that starts with it, i.e. an instruction to run it).
+no_start_command() {
+    if grep -E '^[[:space:]]*(pilotctl daemon (stop && pilotctl daemon )?start|sudo systemctl enable --now pilot-daemon)' "$1" >/dev/null; then
+        fail "$2: the output still tells the agent to start the daemon directly"
+    fi
 }
 
 cfg_get() { # cfg_get <home> <key> — prints the value, "" when absent
@@ -207,7 +254,8 @@ SECRET="s3cretPW"
 PROXY="http://muse:${SECRET}@egress.test:3128"
 # shellcheck disable=SC2016 # the literal command the installer saves
 SANDBOX_CMD='bash -c '\''case $https_proxy in *@*) printf %s "$https_proxy";; *) printf %s "${HTTPS_PROXY:-$https_proxy}";; esac'\'''
-unset HTTPS_PROXY https_proxy ALL_PROXY all_proxy PILOT_TRANSPORT PILOT_PROXY_CMD PILOT_ALLOW_ROOT 2>/dev/null || true
+unset HTTPS_PROXY https_proxy ALL_PROXY all_proxy PILOT_TRANSPORT PILOT_PROXY_CMD PILOT_ALLOW_ROOT \
+      PILOT_PROXY SUDO_USER SUDO_UID SUDO_GID SUDO_COMMAND DOAS_USER PKEXEC_UID 2>/dev/null || true
 
 # 1. --transport is validated.
 if run_install "$WORK/h-bad" "$FIXTURE/new" "$WORK/bad.log" --transport quic; then
@@ -220,6 +268,29 @@ run_install "$WORK/h-default" "$FIXTURE/new" "$WORK/default.log" || fail "defaul
 [ -z "$(cfg_get "$WORK/h-default" transport)" ] || fail "default install saved a transport"
 [ -z "$(cfg_get "$WORK/h-default" proxy_cmd)" ] || fail "default install saved proxy_cmd"
 grep -F "Transport: auto" "$WORK/default.log" >/dev/null || fail "default install did not report transport auto"
+grep -F "Verified SHA-256 (checksums.txt + manifest)" "$WORK/default.log" >/dev/null \
+    || fail "latest_stable install was not checked against both anchors"
+if grep -F -- "--transport compat" "$WORK/default.log" >/dev/null; then
+    fail "a daemon with auto got the UDP-blocked compat hint"
+fi
+
+# 2b. A release without auto (v1.13.x) is not announced as auto: the summary
+#     says udp, and how to get compat where UDP is blocked.
+run_install "$WORK/h-default-old" "$FIXTURE/old" "$WORK/default-old.log" || fail "default install (old daemon)"
+if grep -iE 'Transport: +auto' "$WORK/default-old.log" >/dev/null; then
+    fail "a release without auto was announced as auto"
+fi
+grep -F "Transport: udp (this pilot-daemon, v9.9.9, predates auto" "$WORK/default-old.log" >/dev/null \
+    || fail "old daemon: transport udp not stated"
+grep -F "install.sh | sh -s -- --transport compat" "$WORK/default-old.log" >/dev/null \
+    || fail "old daemon: no compat hint for UDP-blocked hosts"
+grep -E '^[[:space:]]*pilotctl daemon start --hostname' "$WORK/default-old.log" >/dev/null \
+    || fail "a host without a proxy lost the daemon start instruction"
+# ...but not when udp was chosen.
+run_install "$WORK/h-udp-old" "$FIXTURE/old" "$WORK/udp-old.log" --transport udp || fail "--transport udp (old daemon)"
+if grep -F -- "--transport compat" "$WORK/udp-old.log" >/dev/null; then
+    fail "--transport udp got the compat hint"
+fi
 
 # 3. --transport compat is saved and survives a re-run without --transport;
 #    --transport auto then removes it.
@@ -238,6 +309,12 @@ if [ ! -d /run/systemd/system ]; then
      run_install "$WORK/h-sandbox" "$FIXTURE/new" "$LOG") || fail "sandbox install"
     [ "$(cfg_get "$WORK/h-sandbox" proxy_cmd)" = "$SANDBOX_CMD" ] || fail "proxy_cmd not saved in a sandbox: '$(cfg_get "$WORK/h-sandbox" proxy_cmd)'"
     grep -F 'http://***@egress.test:3128' "$LOG" >/dev/null || fail "proxy not shown redacted"
+    # A daemon that uses the proxy is started the ordinary way.
+    grep -E '^[[:space:]]*pilotctl daemon start --hostname' "$LOG" >/dev/null \
+        || fail "a daemon that can use the proxy lost the daemon start instruction"
+    if grep -F "pilot-sandbox recipe" "$LOG" >/dev/null; then
+        fail "a daemon that can use the proxy was sent to the sandbox recipe"
+    fi
     if grep -F "$SECRET" "$LOG" "$WORK/h-sandbox/.pilot/config.json" >/dev/null; then
         fail "proxy credentials leaked"
     fi
@@ -269,6 +346,48 @@ if [ ! -d /run/systemd/system ]; then
     grep -F "cannot use one" "$LOG" >/dev/null || fail "no warning about a proxy the old daemon cannot use"
     grep -F "https://pilotprotocol.network/learn/install-pilot-skills-in-meta-muse" "$LOG" >/dev/null \
         || fail "the old-daemon proxy warning does not point at the sandbox recipe"
+    # The proxy is the way out (its credentials rotate): nothing tells the
+    # agent to run `pilotctl daemon start`, which would dial the registry
+    # around the proxy; GET STARTED points at the recipe instead.
+    no_start_command "$LOG" "old daemon in a proxy-only sandbox"
+    # shellcheck disable=SC2016 # literal backquotes
+    grep -F 'Do NOT run `pilotctl daemon start` on this host' "$LOG" >/dev/null \
+        || fail "GET STARTED does not warn against pilotctl daemon start"
+    [ "$(grep -c -F "https://pilotprotocol.network/learn/install-pilot-skills-in-meta-muse" "$LOG")" -ge 3 ] \
+        || fail "the warning, the no-systemd hint and GET STARTED do not all point at the recipe"
+    if grep -iE 'Transport: +auto' "$LOG" >/dev/null; then fail "old daemon announced as auto (sandbox)"; fi
+    if grep -F -- "--transport compat" "$LOG" >/dev/null; then
+        fail "the compat hint was shown where compat cannot use the proxy either"
+    fi
+    if grep -F "restart the daemon from a fresh shell" "$LOG" >/dev/null; then
+        fail "a daemon that cannot use a proxy was told to refresh proxy credentials"
+    fi
+    # A re-run (update) does not tell it to restart the daemon directly either.
+    LOG="$WORK/oldcmd-rerun.log"
+    (export HTTPS_PROXY="$PROXY"
+     run_install "$WORK/h-oldcmd" "$FIXTURE/old" "$LOG") || fail "old daemon sandbox re-run"
+    no_start_command "$LOG" "old daemon sandbox re-run"
+    grep -F "https://pilotprotocol.network/learn/install-pilot-skills-in-meta-muse" "$LOG" >/dev/null \
+        || fail "the re-run does not point at the recipe"
+    LOG="$WORK/oldcmd.log"
+    # --transport compat on the same host: same story.
+    LOG="$WORK/oldcmd-compat.log"
+    (export HTTPS_PROXY="$PROXY"
+     run_install "$WORK/h-oldcmd-compat" "$FIXTURE/old" "$LOG" --transport compat) || fail "old daemon sandbox compat install"
+    no_start_command "$LOG" "old daemon, compat, proxy-only sandbox"
+    LOG="$WORK/oldcmd.log"
+
+    # A proxy without credentials may not be the only way out: the start
+    # command stays, with the condition and the recipe next to it.
+    LOG="$WORK/old-nocreds.log"
+    (export HTTPS_PROXY=http://egress.test:3128
+     run_install "$WORK/h-old-nocreds" "$FIXTURE/old" "$LOG") || fail "old daemon, proxy without credentials"
+    grep -F "skip the next line and use the pilot-sandbox" "$LOG" >/dev/null \
+        || fail "no condition next to the start command (proxy without credentials)"
+    grep -E '^[[:space:]]*pilotctl daemon start --hostname' "$LOG" >/dev/null \
+        || fail "the start command was dropped for a proxy that may not be the only way out"
+    LOG="$WORK/oldcmd.log"
+
     # auto is not supported, so the daemon runs udp: the stock endpoints stay.
     [ "$(cfg_get "$WORK/h-oldcmd" registry)" = "34.71.57.205:9000" ] || fail "udp install lost the raw registry"
     if grep -F "$SECRET" "$LOG" >/dev/null || grep -rF "$SECRET" "$WORK/h-oldcmd/.pilot" >/dev/null; then
@@ -333,6 +452,15 @@ ENV
     grep -F "installing as root (no systemd" "$LOG" >/dev/null || fail "no root note"
     [ -x "$WORK/h-root/.pilot/bin/pilotctl" ] || fail "root install did not install pilotctl"
     [ "$(cfg_get "$WORK/h-root" proxy_cmd)" = "$SANDBOX_CMD" ] || fail "root sandbox install did not save proxy_cmd"
+
+    # sudo run by root itself (SUDO_UID=0) is still root's own install.
+    LOG="$WORK/root-sudo-root.log"
+    (export PILOT_TEST_UID=0 SUDO_USER=root SUDO_UID=0
+     run_install "$WORK/h-root-sudo-root" "$FIXTURE/new" "$LOG") || fail "root via sudo from root was refused"
+    # PILOT_ALLOW_ROOT=1 still overrides the sudo refusal.
+    LOG="$WORK/root-sudo-allow.log"
+    (export PILOT_TEST_UID=0 SUDO_USER=agent SUDO_UID=1000 PILOT_ALLOW_ROOT=1
+     run_install "$WORK/h-root-sudo-allow" "$FIXTURE/new" "$LOG") || fail "PILOT_ALLOW_ROOT=1 did not override the sudo refusal"
 else
     # 5b. Root on a host with systemd is still refused (PILOT_ALLOW_ROOT=1 overrides).
     LOG="$WORK/root.log"
@@ -371,6 +499,13 @@ if grep -F "34.71.57.205" "$WORK/h-oldctl/.pilot/config.json" >/dev/null; then
     fail "old pilotctl compat install wrote a raw-IP endpoint"
 fi
 
+# 9b. compat with a daemon that predates -transport: the summary does not
+#     claim compat.
+run_install "$WORK/h-ancient" "$FIXTURE/ancient" "$WORK/ancient.log" --transport compat || fail "ancient daemon compat install"
+grep -F "predates compat mode" "$WORK/ancient.log" >/dev/null || fail "ancient daemon: no compat warning"
+grep -F "Transport: udp (compat is saved, but this pilot-daemon" "$WORK/ancient.log" >/dev/null \
+    || fail "ancient daemon: the summary claims compat"
+
 # 10. Root on macOS is refused like on any host with a service manager.
 LOG="$WORK/root-mac.log"
 if (export PILOT_TEST_UID=0 PILOT_TEST_UNAME=Darwin; run_install "$WORK/h-root-mac" "$FIXTURE/new" "$LOG"); then
@@ -378,11 +513,49 @@ if (export PILOT_TEST_UID=0 PILOT_TEST_UNAME=Darwin; run_install "$WORK/h-root-m
 fi
 grep -F "refusing to install as root" "$LOG" >/dev/null || fail "no root refusal on macOS"
 
+# 10b. Root through sudo/doas for a regular user is refused, with or without
+#      systemd: that user could not use a node installed for root.
+for _elev in "SUDO_USER=agent SUDO_UID=1000" "SUDO_USER=agent" "DOAS_USER=agent"; do
+    LOG="$WORK/root-elev.log"
+    rm -rf "$WORK/h-root-elev"
+    # shellcheck disable=SC2086,SC2163 # intentional split into NAME=value words
+    if (export PILOT_TEST_UID=0 $_elev; run_install "$WORK/h-root-elev" "$FIXTURE/new" "$LOG"); then
+        fail "root install under '$_elev' was accepted"
+    fi
+    grep -F "refusing to install as root: this runs under" "$LOG" >/dev/null || fail "no sudo refusal ($_elev)"
+    grep -F "for agent" "$LOG" >/dev/null || fail "the sudo refusal does not name the user ($_elev)"
+    [ ! -e "$WORK/h-root-elev/.pilot" ] || fail "refused sudo install left ~/.pilot behind ($_elev)"
+done
+
+# 10c. --version / --channel beta: a tag the manifest does not describe is
+#      checked against checksums.txt alone (previously: "integrity anchors
+#      disagree" for every tag but latest_stable).
+for _mf in pinned pinned-nourl; do
+    run_install "$WORK/h-pin-$_mf" "$FIXTURE/$_mf" "$WORK/pin-$_mf.log" --version v9.9.8 --yes \
+        || fail "--version v9.9.8 ($_mf manifest) was refused"
+    grep -F "Verified SHA-256 (checksums.txt)" "$WORK/pin-$_mf.log" >/dev/null \
+        || fail "--version v9.9.8 ($_mf manifest): not verified against checksums.txt"
+    [ "$(cat "$WORK/h-pin-$_mf/.pilot/bin/.pilot-version")" = v9.9.8 ] || fail "--version v9.9.8 ($_mf): wrong version file"
+    run_install "$WORK/h-beta-$_mf" "$FIXTURE/$_mf" "$WORK/beta-$_mf.log" --channel beta \
+        || fail "--channel beta ($_mf manifest) was refused"
+    grep -F "Downloading v9.9.10-rc.1" "$WORK/beta-$_mf.log" >/dev/null || fail "--channel beta did not resolve the beta tag"
+    # The tag the manifest describes still needs both anchors to agree.
+    if run_install "$WORK/h-latest-$_mf" "$FIXTURE/$_mf" "$WORK/latest-$_mf.log" --version v9.9.9; then
+        fail "a manifest hash that disagrees was ignored for latest_stable ($_mf)"
+    fi
+    grep -F "integrity anchors disagree" "$WORK/latest-$_mf.log" >/dev/null || fail "no anchor mismatch error ($_mf)"
+done
+# A manifest whose platform url names the pinned tag is an anchor for it.
+if run_install "$WORK/h-pin-named" "$FIXTURE/pinned-named" "$WORK/pin-named.log" --version v9.9.8 --yes; then
+    fail "a manifest hash for the pinned tag that disagrees was ignored"
+fi
+grep -F "integrity anchors disagree" "$WORK/pin-named.log" >/dev/null || fail "no anchor mismatch error (url names the tag)"
+
 # 11. --help prints the whole usage header and nothing past it.
-sh "$ROOT/install.sh" --help > "$WORK/help.log" 2>&1 || fail "--help failed"
+"${PILOT_TEST_SH:-sh}" "$ROOT/install.sh" --help > "$WORK/help.log" 2>&1 || fail "--help failed"
 grep -F -- "--transport <mode>" "$WORK/help.log" >/dev/null || fail "--help lacks --transport"
 grep -F "with a message, never fatal." "$WORK/help.log" >/dev/null || fail "--help cut the header short"
 if grep -F "WHAT THIS SCRIPT DOES" "$WORK/help.log" >/dev/null; then fail "--help printed past the usage header"; fi
 
-rm -rf "$WORK"
+if [ -n "${PILOT_TEST_KEEP:-}" ]; then echo "logs kept in $WORK"; else rm -rf "$WORK"; fi
 echo "proxy/transport installer contract: ok"
