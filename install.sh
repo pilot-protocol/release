@@ -2229,6 +2229,9 @@ echo "  The daemon scans every 15 minutes and injects the Pilot Protocol"
 echo "  skill into installed agent tools. Triggering a first pass right now"
 echo "  so your agents know about Pilot before the daemon is even started:"
 echo ""
+# pilotctl fetches the skills through this process's proxy settings: hand it
+# the current credentials if they rotated since the downloads.
+proxy_refresh || true
 if "${BIN_DIR}/pilotctl" skills check 2>&1 | sed 's/^/    /'; then
     :
 else
