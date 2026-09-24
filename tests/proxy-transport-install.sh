@@ -20,6 +20,12 @@
 #     to run `pilotctl daemon start` where the proxy is the way out, and a
 #     release without auto is not announced as auto (with the compat re-run
 #     for UDP-blocked hosts);
+#   - the sandbox proxy_cmd is saved only for credentials a fresh shell sees
+#     (not for PILOT_PROXY's), and never over an explicit PILOT_PROXY;
+#   - restart advice on a proxy-only host stops the running daemon before the
+#     recipe starts one; macOS is never sent to the Linux-only recipe, and its
+#     LaunchAgent start line carries the same condition as the others;
+#   - --transport auto with a daemon that predates auto says what stays saved;
 #   - --version / --channel beta install a tag the manifest does not describe
 #     (checksums.txt is its anchor), while the manifest hash still has to
 #     agree for the tag it describes.
@@ -128,8 +134,9 @@ chmod 755 "$FIXTURE"/new/archive/* "$FIXTURE"/old/archive/* "$FIXTURE"/ancient/a
 
 make_release() { # make_release <dir> <tag> [<beta tag> [<manifest sha256> [<platform url tag>]]]
     COPYFILE_DISABLE=1 tar -czf "$1/pilot-linux-amd64.tar.gz" -C "$1/archive" .
+    cp "$1/pilot-linux-amd64.tar.gz" "$1/pilot-darwin-amd64.tar.gz" # same fixture binaries
     _sha=$(shasum -a 256 "$1/pilot-linux-amd64.tar.gz" | awk '{print $1}')
-    printf '%s  %s\n' "$_sha" pilot-linux-amd64.tar.gz > "$1/checksums.txt"
+    printf '%s  %s\n%s  %s\n' "$_sha" pilot-linux-amd64.tar.gz "$_sha" pilot-darwin-amd64.tar.gz > "$1/checksums.txt"
     _url=""
     if [ -n "${5:-}" ]; then
         _url="\"url\": \"https://github.com/pilot-protocol/pilotprotocol/releases/download/$5/pilot-linux-amd64.tar.gz\", "
@@ -139,7 +146,7 @@ make_release() { # make_release <dir> <tag> [<beta tag> [<manifest sha256> [<pla
   "schema_version": 1,
   "latest_stable": "$2",
   "channels": {"stable": "$2", "beta": "${3:-$2}"},
-  "platforms": {"linux-amd64": {${_url}"sha256": "${4:-$_sha}"}}
+  "platforms": {"linux-amd64": {${_url}"sha256": "${4:-$_sha}"}, "darwin-amd64": {"sha256": "${4:-$_sha}"}}
 }
 JSON
 }
@@ -209,6 +216,7 @@ fi
 case "$url" in
   */.well-known/latest.json) src="$PILOT_TEST_RELEASE/stable-manifest.json" ;;
   */pilot-linux-amd64.tar.gz) src="$PILOT_TEST_RELEASE/pilot-linux-amd64.tar.gz" ;;
+  */pilot-darwin-amd64.tar.gz) src="$PILOT_TEST_RELEASE/pilot-darwin-amd64.tar.gz" ;;
   */checksums.txt) src="$PILOT_TEST_RELEASE/checksums.txt" ;;
   *) echo "unexpected curl URL: $url" >&2; exit 88 ;;
 esac
@@ -216,6 +224,8 @@ cp "$src" "$output"
 SH
 # Never escalate on the machine running the test.
 printf '#!/bin/sh\nexit 1\n' > "$FAKEBIN/sudo"
+# launchd (PILOT_TEST_UNAME=Darwin cases): nothing is loaded, nothing fails.
+printf '#!/bin/sh\nexit 0\n' > "$FAKEBIN/launchctl"
 # `id -u` answers $PILOT_TEST_UID when set.
 REAL_ID=$(command -v id)
 cat > "$FAKEBIN/id" <<SH
@@ -301,6 +311,19 @@ run_install "$WORK/h-compat" "$FIXTURE/new" "$WORK/compat2.log" || fail "compat 
 run_install "$WORK/h-compat" "$FIXTURE/new" "$WORK/compat3.log" --transport auto || fail "auto re-run"
 [ -z "$(cfg_get "$WORK/h-compat" transport)" ] || fail "--transport auto did not remove the saved transport"
 
+# 3b. --transport auto with a daemon that predates auto: nothing to go back
+#     to, so the saved compat stays and the output says so (it used to say
+#     the daemon "keeps its default (udp)" and then report compat).
+run_install "$WORK/h-compat-old" "$FIXTURE/old" "$WORK/compat-old.log" --transport compat || fail "old daemon compat install"
+run_install "$WORK/h-compat-old" "$FIXTURE/old" "$WORK/compat-old2.log" --transport auto || fail "old daemon auto re-run"
+[ "$(cfg_get "$WORK/h-compat-old" transport)" = compat ] || fail "old daemon: --transport auto changed the saved transport"
+grep -F "transport saved in config.json (compat)" "$WORK/compat-old2.log" >/dev/null \
+    || fail "old daemon: --transport auto does not say the saved compat stays"
+if grep -F "keeps its default (udp)" "$WORK/compat-old2.log" >/dev/null; then
+    fail "old daemon: --transport auto claims udp while compat stays saved"
+fi
+grep -F "Transport: compat" "$WORK/compat-old2.log" >/dev/null || fail "old daemon: summary does not report the saved compat"
+
 # 4. Sandbox (Linux without systemd) with a credential-bearing HTTPS_PROXY:
 #    proxy_cmd is saved and the credentials never reach the output.
 if [ ! -d /run/systemd/system ]; then
@@ -369,6 +392,11 @@ if [ ! -d /run/systemd/system ]; then
     no_start_command "$LOG" "old daemon sandbox re-run"
     grep -F "https://pilotprotocol.network/learn/install-pilot-skills-in-meta-muse" "$LOG" >/dev/null \
         || fail "the re-run does not point at the recipe"
+    # The recipe starts a daemon but never stops one: the restart advice
+    # must stop the running one first, or following it runs two daemons
+    # with one identity.
+    grep -F "Stop the running daemon first: pilotctl daemon stop" "$LOG" >/dev/null \
+        || fail "the re-run advice dropped \`pilotctl daemon stop\` before the recipe"
     LOG="$WORK/oldcmd.log"
     # --transport compat on the same host: same story.
     LOG="$WORK/oldcmd-compat.log"
@@ -382,7 +410,7 @@ if [ ! -d /run/systemd/system ]; then
     LOG="$WORK/old-nocreds.log"
     (export HTTPS_PROXY=http://egress.test:3128
      run_install "$WORK/h-old-nocreds" "$FIXTURE/old" "$LOG") || fail "old daemon, proxy without credentials"
-    grep -F "skip the next line and use the pilot-sandbox" "$LOG" >/dev/null \
+    grep -F "skip the next line; what works then:" "$LOG" >/dev/null \
         || fail "no condition next to the start command (proxy without credentials)"
     grep -E '^[[:space:]]*pilotctl daemon start --hostname' "$LOG" >/dev/null \
         || fail "the start command was dropped for a proxy that may not be the only way out"
@@ -444,6 +472,27 @@ ENV
     LOG="$WORK/pilot-proxy.log"
     (export PILOT_PROXY=http://relay.test:3128 PILOT_TEST_EXPECT_PROXY=http://relay.test:3128
      run_install "$WORK/h-pilot-proxy" "$FIXTURE/new" "$LOG") || fail "downloads did not use PILOT_PROXY"
+
+    # 4d. Credentials that come from PILOT_PROXY never reach a fresh shell,
+    #     so the sandbox proxy command (which prints a fresh shell's
+    #     $https_proxy / $HTTPS_PROXY) is not saved and rotation is not
+    #     claimed; nor does it replace an explicit PILOT_PROXY next to a
+    #     credential-bearing HTTPS_PROXY (the daemon runs a proxy command in
+    #     place of the URL it would use).
+    LOG="$WORK/pilot-proxy-creds.log"
+    (export PILOT_PROXY="$PROXY"
+     run_install "$WORK/h-pilot-proxy-creds" "$FIXTURE/new" "$LOG") || fail "PILOT_PROXY with credentials"
+    [ -z "$(cfg_get "$WORK/h-pilot-proxy-creds" proxy_cmd)" ] || fail "sandbox proxy_cmd saved for credentials that come from PILOT_PROXY"
+    if grep -F -e "re-read by the daemon" -e "rotation needs no restart" "$LOG" >/dev/null; then
+        fail "rotation claimed for credentials that come from PILOT_PROXY"
+    fi
+    if grep -F "$SECRET" "$LOG" >/dev/null || grep -rF "$SECRET" "$WORK/h-pilot-proxy-creds/.pilot" >/dev/null; then
+        fail "proxy credentials leaked (PILOT_PROXY)"
+    fi
+    LOG="$WORK/pilot-proxy-explicit.log"
+    (export PILOT_PROXY=http://relay.test:3128 HTTPS_PROXY="$PROXY"
+     run_install "$WORK/h-pilot-proxy-explicit" "$FIXTURE/new" "$LOG") || fail "explicit PILOT_PROXY next to HTTPS_PROXY"
+    [ -z "$(cfg_get "$WORK/h-pilot-proxy-explicit" proxy_cmd)" ] || fail "sandbox proxy_cmd saved over an explicit PILOT_PROXY"
 
     # 5. Root: allowed in a Linux container/VM without systemd.
     LOG="$WORK/root.log"
@@ -512,6 +561,34 @@ if (export PILOT_TEST_UID=0 PILOT_TEST_UNAME=Darwin; run_install "$WORK/h-root-m
     fail "root install on macOS was accepted"
 fi
 grep -F "refusing to install as root" "$LOG" >/dev/null || fail "no root refusal on macOS"
+
+# 10a. macOS with a proxy this release cannot use: the LaunchAgent start
+#      line carries the same condition as every other start line, and
+#      nothing points at the Linux-root-only sandbox recipe.
+LOG="$WORK/mac-proxy.log"
+(export PILOT_TEST_UNAME=Darwin HTTPS_PROXY="$PROXY"
+ run_install "$WORK/h-mac-proxy" "$FIXTURE/old" "$LOG") || fail "macOS install behind a proxy (old daemon)"
+grep -F "cannot use one" "$LOG" >/dev/null || fail "macOS: no warning about a proxy the old daemon cannot use"
+if grep -F "pilot-sandbox recipe (step 3)" "$LOG" >/dev/null; then
+    fail "macOS was sent to the Linux-only pilot-sandbox recipe"
+fi
+if grep -E '^[[:space:]]*Start daemon: launchctl load' "$LOG" >/dev/null; then
+    fail "macOS: the LaunchAgent start line has no condition next to it"
+fi
+grep -F "it will not come online with" "$LOG" >/dev/null || fail "macOS: no condition next to the LaunchAgent start line"
+grep -F "lists -proxy" "$LOG" >/dev/null || fail "macOS: no way forward named"
+LOG="$WORK/mac-proxy-cmd.log"
+(export PILOT_TEST_UNAME=Darwin HTTPS_PROXY="$PROXY" PILOT_PROXY_CMD='cat /run/proxy-url'
+ run_install "$WORK/h-mac-proxy-cmd" "$FIXTURE/old" "$LOG") || fail "macOS install, PILOT_PROXY_CMD (old daemon)"
+if grep -E '^[[:space:]]*(launchctl load|Start daemon: launchctl load)' "$LOG" >/dev/null; then
+    fail "macOS proxy-only: still told to load the LaunchAgent"
+fi
+# shellcheck disable=SC2016 # literal backquotes
+grep -F 'Do not run `launchctl load -w' "$LOG" >/dev/null || fail "macOS proxy-only: no warning against loading the LaunchAgent"
+if grep -F "pilot-sandbox recipe (step 3)" "$LOG" >/dev/null; then
+    fail "macOS proxy-only was sent to the Linux-only pilot-sandbox recipe"
+fi
+if grep -F "$SECRET" "$LOG" >/dev/null; then fail "proxy credentials leaked (macOS)"; fi
 
 # 10b. Root through sudo/doas for a regular user is refused, with or without
 #      systemd: that user could not use a node installed for root.
