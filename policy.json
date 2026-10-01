@@ -1,11 +1,11 @@
 {
   "_purpose": "Hand-maintained sidecar consumed by scripts/compute-closure.py and the receiver workflows. Every other piece of state (graph edges, latest versions, install URLs) is derived from live tags and go.mod files.",
   "_zones": {
-    "0": "Freeloader — not in cascade; no tag, no release",
-    "1": "Tag-only Go module — auto-cascade auto-tags beta",
-    "2": "Artifact hub — cascade opens daily PR; tag = full release pipeline",
-    "3": "Package distribution (npm/pypi/swiftpm/brew) — cascade opens PR; tag publishes",
-    "4": "Surface — deploys from main; no version semantics"
+    "0": "Freeloader \u2014 not in cascade; no tag, no release",
+    "1": "Tag-only Go module \u2014 auto-cascade auto-tags beta",
+    "2": "Artifact hub \u2014 cascade opens daily PR; tag = full release pipeline",
+    "3": "Package distribution (npm/pypi/swiftpm/brew) \u2014 cascade opens PR; tag publishes",
+    "4": "Surface \u2014 deploys from main; no version semantics"
   },
   "nodes": {
     "common": {
@@ -36,21 +36,7 @@
         "mode": "auto"
       }
     },
-    "gateway": {
-      "zone": 1,
-      "bump_policy": {
-        "stable_only": true,
-        "mode": "auto"
-      }
-    },
     "handshake": {
-      "zone": 1,
-      "bump_policy": {
-        "stable_only": true,
-        "mode": "auto"
-      }
-    },
-    "nameserver": {
       "zone": 1,
       "bump_policy": {
         "stable_only": true,

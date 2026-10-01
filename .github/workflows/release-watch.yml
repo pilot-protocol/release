@@ -70,7 +70,7 @@ jobs:
           # their cascades would compute empty closures, so they are not
           # watched. Node name == repo name except the hub:
           # web4 -> pilot-protocol/pilotprotocol.
-          NODES="common beacon gateway dataexchange eventstream handshake nameserver policy rendezvous runtime skillinject trustedagents updater webhook libpilot app-store examples cosift pilot-ca wallet web4"
+          NODES="common beacon dataexchange eventstream handshake policy rendezvous runtime skillinject trustedagents updater webhook libpilot app-store examples cosift pilot-ca wallet web4"
 
           STATE=state/release-watch.json
           mkdir -p state
