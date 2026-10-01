@@ -1,6 +1,6 @@
 {
   "common": "v0.5.15",
-  "beacon": "v0.2.10-beta.2",
+  "beacon": "v0.2.10",
   "gateway": "v0.2.2-beta.6",
   "dataexchange": "v0.2.4-beta.1",
   "eventstream": "v0.2.5-beta.3",
@@ -9,15 +9,15 @@
   "policy": "v0.2.4-beta.6",
   "rendezvous": "v0.2.9-beta.3",
   "runtime": "v0.3.3-beta.5",
-  "skillinject": "v0.2.5-beta.1",
-  "trustedagents": "v0.2.6-beta.4",
-  "updater": "v0.2.6-beta.1",
+  "skillinject": "v0.2.5",
+  "trustedagents": "v0.2.6",
+  "updater": "v0.2.6",
   "webhook": "v0.2.1-beta.11",
-  "libpilot": "v0.3.1-beta.20",
+  "libpilot": "v0.3.1-beta.21",
   "app-store": "v1.0.5",
   "examples": "v0.2.0",
   "cosift": "v0.4.1",
   "pilot-ca": "v0.1.0",
   "wallet": "v0.3.0-rc1",
-  "web4": "v1.14.1-rc.1"
+  "web4": "v1.14.1"
 }
