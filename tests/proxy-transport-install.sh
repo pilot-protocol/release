@@ -30,7 +30,7 @@
 #     (checksums.txt is its anchor), while the manifest hash still has to
 #     agree for the tag it describes.
 #
-# Like tests/managed-install.sh it installs a fixture release through a fake
+# It installs a fixture release through a fake
 # curl, so it needs no network. It never uses sudo (a fake sudo fails), and the
 # root cases fake `id -u`; run it in a disposable container to also exercise
 # the /usr/local/bin links as real root.
@@ -159,7 +159,7 @@ OTHER_SHA=0000000000000000000000000000000000000000000000000000000000000000
 mkdir -p "$FIXTURE/pinned"
 cp -R "$FIXTURE/new/archive" "$FIXTURE/pinned/archive"
 make_release "$FIXTURE/pinned" v9.9.9 v9.9.10-rc.1 "$OTHER_SHA" v9.9.9
-# The same without urls (a managed-runtime-style manifest): latest_stable only.
+# The same without urls: latest_stable only.
 mkdir -p "$FIXTURE/pinned-nourl"
 cp -R "$FIXTURE/new/archive" "$FIXTURE/pinned-nourl/archive"
 make_release "$FIXTURE/pinned-nourl" v9.9.9 v9.9.10-rc.1 "$OTHER_SHA"
