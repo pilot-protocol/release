@@ -90,11 +90,19 @@ jobs:
             # existing pins never reconciled. Highest strict-semver tag,
             # prereleases included (a beta upstream dispatches with
             # is_prerelease=true and the receivers' stable_only gate
-            # decides). Sort -V, tail -1.
-            latest=$(gh api "repos/$repo/tags?per_page=100" \
+            # decides).
+            #
+            # Plain `sort -V` ranks a release BELOW its own prereleases
+            # (v1.0.2 < v1.0.2-beta.3), so once a beta existed the stable
+            # tag cut from it was never the "latest", never differed from
+            # the recorded state, and never fired the cascade. GNU sort -V
+            # orders "~" before the end of the string, so swapping the
+            # first "-" for "~" gives semver precedence. --paginate: a repo
+            # with more than 100 tags returned an arbitrary first page.
+            latest=$(gh api --paginate "repos/$repo/tags?per_page=100" \
                        --jq '.[].name' 2>/dev/null \
                      | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$' \
-                     | sort -V | tail -1 || true)
+                     | sed 's/-/~/' | sort -V | tail -1 | sed 's/~/-/' || true)
             [ -n "$latest" ] || continue
 
             # Same strict-semver gate as notify.yml (PILOT-315).
