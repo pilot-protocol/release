@@ -113,13 +113,23 @@ jobs:
                 go mod edit -dropreplace="${r}"
               done
 
-          # Unconditionally drop the legacy pilot-protocol/pilotprotocol
-          # require + replace — pre-migration sentinels pinned to
-          # v0.0.0 that never resolve from the proxy. go mod edit
-          # is a no-op when the entry is absent, so safe.
-          echo "::notice::dropping legacy TeoSlayer hub entries"
-          go mod edit -droprequire=github.com/pilot-protocol/pilotprotocol 2>/dev/null || true
-          go mod edit -dropreplace=github.com/pilot-protocol/pilotprotocol 2>/dev/null || true
+          # Drop the legacy pilot-protocol/pilotprotocol require + replace
+          # — pre-migration sentinels pinned to v0.0.0 that never resolve
+          # from the proxy. Only the sentinel: a real hub pin must stay.
+          # Dropping it unconditionally let `go mod tidy` re-add the hub
+          # at the LOWEST version the other requirements allow, so every
+          # non-hub bump silently downgraded it (libpilot#58, 2026-10-01:
+          # v1.14.1 -> v1.14.0; libpilot#56: v1.13.9 -> v1.13.6).
+          HUB=github.com/pilot-protocol/pilotprotocol
+          hub_ver=$(go mod edit -json | jq -r --arg m "$HUB" \
+            '(.Require // [])[] | select(.Path == $m) | .Version')
+          case "$hub_ver" in
+            v0.0.0|v0.0.0-*)
+              echo "::notice::dropping legacy hub sentinel ${hub_ver}"
+              go mod edit -droprequire="$HUB"
+              ;;
+          esac
+          go mod edit -dropreplace="$HUB" 2>/dev/null || true
 
           go mod edit -require="${UP}@${VER}"
           go mod tidy
