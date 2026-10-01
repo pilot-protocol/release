@@ -14,10 +14,10 @@
   "updater": "v0.2.6-beta.1",
   "webhook": "v0.2.1-beta.11",
   "libpilot": "v0.3.1-beta.20",
-  "app-store": "v1.0.4",
+  "app-store": "v1.0.5",
   "examples": "v0.2.0",
   "cosift": "v0.4.1",
   "pilot-ca": "v0.1.0",
   "wallet": "v0.3.0-rc1",
-  "web4": "v1.14.0-rc.1"
+  "web4": "v1.14.1-rc.1"
 }
