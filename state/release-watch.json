@@ -1,13 +1,13 @@
 {
   "common": "v0.6.0",
-  "beacon": "v0.2.11",
+  "beacon": "v0.2.12",
   "gateway": "v0.2.2-beta.6",
   "dataexchange": "v0.3.1-beta.1",
   "eventstream": "v0.3.1-beta.1",
   "handshake": "v0.3.1-beta.1",
   "nameserver": "v0.2.2-beta.6",
   "policy": "v0.2.4-beta.7",
-  "rendezvous": "v0.2.9-beta.7",
+  "rendezvous": "v0.2.9-beta.8",
   "runtime": "v0.3.3-beta.8",
   "skillinject": "v0.2.6-beta.1",
   "trustedagents": "v0.2.7-beta.1",
@@ -19,5 +19,5 @@
   "cosift": "v0.4.1",
   "pilot-ca": "v0.1.0",
   "wallet": "v0.3.0-rc1",
-  "web4": "v1.14.1"
+  "web4": "v1.15.0"
 }
