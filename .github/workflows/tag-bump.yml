@@ -66,8 +66,12 @@ jobs:
     env:
       HAS_APP: ${{ secrets.RELEASE_APP_ID != '' }}
     steps:
+      # main as it is when the run starts. The default is the commit main
+      # was at when the event fired, and a run that waited in the queue
+      # behind another bump would build on it and conflict with that
+      # bump's merge (runtime#49 and webhook#43, 2026-10-07).
       - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+        with: { fetch-depth: 0, ref: main }
 
       - name: Mint App token
         # PRs and pushes made with the default GITHUB_TOKEN never trigger
@@ -140,6 +144,30 @@ jobs:
               ;;
           esac
           go mod edit -dropreplace="$HUB" 2>/dev/null || true
+
+          # Never a downgrade: queued runs need not run in tag order.
+          # at_least A B: module version A is B or newer, by semver (a
+          # release ranks above its prereleases, which sort -V reverses).
+          at_least() {
+            python3 - "$1" "$2" <<'PY'
+          import sys
+          def key(v):
+              core, _, pre = v.lstrip("v").split("+")[0].partition("-")
+              nums = tuple(int(x) for x in core.split("."))
+              if not pre:
+                  return nums, (1,)
+              ids = tuple((0, int(i), "") if i.isdigit() else (1, 0, i) for i in pre.split("."))
+              return nums, (0,) + ids
+          sys.exit(0 if key(sys.argv[1]) >= key(sys.argv[2]) else 1)
+          PY
+          }
+          cur=$(go mod edit -json | jq -r --arg m "$UP" \
+            '(.Require // [])[] | select(.Path == $m) | .Version')
+          if [ -n "$cur" ] && [ "$cur" != "$VER" ] && at_least "$cur" "$VER"; then
+            echo "::notice::${UP} is already at ${cur}, newer than ${VER} — skipping"
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           go mod edit -require="${UP}@${VER}"
           go mod tidy
