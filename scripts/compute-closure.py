@@ -74,7 +74,7 @@ def gh(cmd: list[str], *, allow_missing: bool = False) -> str:
 
 
 def list_org_repos(org: str) -> list[dict]:
-    raw = gh(["gh", "repo", "list", org, "--json", "name,defaultBranchRef", "--limit", "200"])
+    raw = gh(["gh", "repo", "list", org, "--json", "name,defaultBranchRef,isArchived", "--limit", "200"])
     return json.loads(raw) if raw else []
 
 
@@ -198,6 +198,14 @@ def build_graph(org: str, hub: str, policy: dict) -> tuple[dict[str, list[str]],
         # The hub is handled explicitly below as node "web4"; skip its
         # repo here so it does not also become a duplicate "pilotprotocol".
         if name == hub_repo:
+            continue
+        # An archived repo is read-only: its cascade.yml is still on disk
+        # (so has_cascade_receiver says yes) but every dispatch to it is a
+        # 403, which failed every common cascade on gateway + nameserver.
+        # It can never tag again either, so it is not a path for the
+        # cascade to travel through. Leave it out of the graph.
+        if r.get("isArchived"):
+            print(f"# skipped repo {name}: archived", file=sys.stderr)
             continue
         ref = (r.get("defaultBranchRef") or {}).get("name") or "main"
 

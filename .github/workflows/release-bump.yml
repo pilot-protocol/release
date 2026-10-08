@@ -51,6 +51,21 @@ permissions:
 jobs:
   bump:
     runs-on: ubuntu-latest
+    # One bump at a time per repository. Several upstreams tagged
+    # together fire one run each at the same moment; on 2026-10-07 three
+    # hub runs raced on bump/2026-10-07 and two were rejected ("fetch
+    # first"), losing their bumps. In a called workflow the github
+    # context is the CALLER's, so github.repository is the repo that owns
+    # the branch (web4 -> pilot-protocol/pilotprotocol), not this one.
+    # queue: max keeps every waiting run. The default, queue: single,
+    # would cancel the older of two pending runs, which drops a bump just
+    # as the push race did. Per repository rather than per daily branch,
+    # so the day can be read when the run starts: a re-run on a later day
+    # bumps that day's branch.
+    concurrency:
+      group: release-bump-${{ github.repository }}
+      cancel-in-progress: false
+      queue: max
     env:
       HAS_APP: ${{ secrets.RELEASE_APP_ID != '' }}
     steps:
@@ -92,51 +107,135 @@ jobs:
           UP: ${{ inputs.upstream }}
           VER: ${{ inputs.version }}
         run: |
-          BRANCH="bump/$(date -u +%Y-%m-%d)"
+          DAY=$(date -u +%Y-%m-%d)
+          BRANCH="bump/${DAY}"
 
           # If the daily branch already exists on remote, fetch + check
           # it out so this commit lands on top of any earlier bump
-          # from today. Otherwise create it.
+          # from today. Otherwise create it from main as it is now: the
+          # checkout is main as it was when the event fired, and a run
+          # that waited in the queue may be well behind it.
+          git fetch origin main
           if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
             git fetch origin "$BRANCH"
-            git checkout "$BRANCH"
-            git pull --rebase origin "$BRANCH"
+            git checkout -B "$BRANCH" FETCH_HEAD
           else
-            git checkout -b "$BRANCH"
+            git checkout -B "$BRANCH" origin/main
           fi
 
-          go mod edit -require="${UP}@${VER}"
-          go mod tidy
-
-          if git diff --quiet go.mod go.sum; then
-            echo "::notice::no go.mod changes — idempotent skip"
-            exit 0
-          fi
-
-          # Verify the bumped tree still builds + tests pass. If it
-          # doesn't, leave the diff uncommitted so the next attempt
-          # picks it up after the upstream issue is fixed.
-          go build ./...
-          go test ./... -short -timeout 5m
+          # at_least A B: module version A is B or newer, by semver (a
+          # release ranks above its prereleases, which sort -V reverses).
+          at_least() {
+            python3 - "$1" "$2" <<'PY'
+          import sys
+          def key(v):
+              core, _, pre = v.lstrip("v").split("+")[0].partition("-")
+              nums = tuple(int(x) for x in core.split("."))
+              if not pre:
+                  return nums, (1,)
+              ids = tuple((0, int(i), "") if i.isdigit() else (1, 0, i) for i in pre.split("."))
+              return nums, (0,) + ids
+          sys.exit(0 if key(sys.argv[1]) >= key(sys.argv[2]) else 1)
+          PY
+          }
 
           git config user.name  "pilot-release-bot"
           git config user.email "release-bot@pilotprotocol.network"
-          git add go.mod go.sum
-          git commit -m "deps: bump ${UP} to ${VER}"
           git config --local --unset-all http.https://github.com/.extraheader || true
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          git push origin "$BRANCH"
+
+          # Bump, verify, commit, push. The concurrency group serialises
+          # this workflow's own runs, but anything else that moves the
+          # branch between our fetch and our push (a manual push, a run
+          # still on the pre-queue workflow) makes the push non-fast-
+          # forward. On a rejection, fetch the new tip and re-apply the
+          # bump on top of it, up to 5 times. Re-applying rather than
+          # `git rebase`: two bumps edit neighbouring require lines of
+          # go.mod (common/dataexchange are adjacent) and go.sum, which
+          # a textual rebase reports as a conflict, and even a clean one
+          # can leave go.mod untidy for the combined requirements.
+          RETRIES=5
+          retry=0
+          skipped=0
+          while :; do
+            # Never a downgrade: queued runs need not run in tag order, and
+            # a replay after a rejected push lands on a tip that may
+            # already pin a later version.
+            cur=$(go mod edit -json | jq -r --arg m "$UP" \
+              '(.Require // [])[] | select(.Path == $m) | .Version')
+            if [ -n "$cur" ] && [ "$cur" != "$VER" ] && at_least "$cur" "$VER"; then
+              echo "::notice::${UP} is already at ${cur}, newer than ${VER} — skipping"
+              skipped=1
+              break
+            fi
+
+            go mod edit -require="${UP}@${VER}"
+            go mod tidy
+
+            # Already pinned (on main, on the branch, or by the run that
+            # beat us to the push with the same bump; a re-run or a
+            # duplicate dispatch): nothing to add, and not an error.
+            if git diff --quiet go.mod go.sum; then
+              echo "::notice::${UP}@${VER} already pinned — idempotent skip"
+              skipped=1
+              break
+            fi
+
+            # Verify the bumped tree still builds + tests pass. If it
+            # doesn't, leave the diff uncommitted so the next attempt
+            # picks it up after the upstream issue is fixed. After a
+            # replay this re-checks the combined tree; unchanged
+            # packages come from the build and test caches.
+            go build ./...
+            go test ./... -short -timeout 5m
+
+            git add go.mod go.sum
+            git commit -m "deps: bump ${UP} to ${VER}"
+            if git push origin "$BRANCH"; then
+              break
+            fi
+
+            retry=$((retry + 1))
+            if [ "$retry" -gt "$RETRIES" ]; then
+              echo "::error::push to ${BRANCH} still rejected after ${RETRIES} retries"
+              exit 1
+            fi
+            echo "::warning::push to ${BRANCH} rejected; retry ${retry}/${RETRIES} on top of the new tip"
+            if git fetch origin "$BRANCH"; then
+              git reset --hard FETCH_HEAD
+            else
+              # Branch not on the remote (the push failed for another
+              # reason): drop our commit and re-apply on the same base.
+              git reset --hard HEAD~1
+            fi
+          done
+
+          # Nothing pushed by this run. The branch still needs its PR if an
+          # earlier attempt pushed the bump and then failed to open it (a
+          # re-run lands here); otherwise there is nothing to do.
+          if [ "$skipped" = 1 ] && git diff --quiet origin/main HEAD -- go.mod go.sum; then
+            exit 0
+          fi
 
           # Open the PR if one is not already open for this branch.
           # If it exists, the push above appended a new commit; no
-          # second PR is created.
+          # second PR is created. A create that fails because another
+          # run opened the PR in the meantime is not an error.
           existing=$(gh pr list --head "$BRANCH" --state open \
                        --json number -q '.[0].number')
           if [ -z "$existing" ]; then
-            gh pr create \
+            if ! gh pr create \
               --base main --head "$BRANCH" \
-              --title "deps: daily bump $(date -u +%Y-%m-%d)" \
-              --body "Auto-cascade from upstream releases. This PR coalesces every bump-upstream dispatch that arrived today; merge it when the daemon is ready to ship a new release. A merged commit on main fires the repo's own release.yml which tags + builds + publishes binaries. Until then, this PR is the queue."
+              --title "deps: daily bump ${DAY}" \
+              --body "Auto-cascade from upstream releases. This PR coalesces every bump-upstream dispatch that arrived today; merge it when the daemon is ready to ship a new release. A merged commit on main fires the repo's own release.yml which tags + builds + publishes binaries. Until then, this PR is the queue."; then
+              existing=$(gh pr list --head "$BRANCH" --state open \
+                           --json number -q '.[0].number')
+              if [ -z "$existing" ]; then
+                echo "::error::could not create or find the PR for ${BRANCH}"
+                exit 1
+              fi
+              echo "::notice::PR #${existing} opened concurrently for ${BRANCH}; appended commit"
+            fi
           else
             echo "::notice::PR #${existing} already open for ${BRANCH}; appended commit"
           fi
