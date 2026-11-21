@@ -5,8 +5,10 @@ compatibility_date = "2026-05-01"
 compatibility_flags = ["nodejs_compat"]
 
 # Route everything that hits pilotprotocol.network/install.sh,
-# /.well-known/latest.json, /.well-known/cascade-status.json through
-# this worker. The website (Cloudflare Pages) handles the rest.
+# /.well-known/latest.json, /.well-known/cascade-status.json and
+# /api/changelog through this worker. The website (the
+# pilot-protocol-website Worker, route pilotprotocol.network/*) handles the
+# rest; these routes are more specific, so they win.
 routes = [
   { pattern = "pilotprotocol.network/install.sh", custom_domain = false },
   { pattern = "pilotprotocol.network/.well-known/*", custom_domain = false },
@@ -14,7 +16,9 @@ routes = [
   # requests fell through to the website worker (405), so every
   # tag-bump auto-changelog since the feature shipped silently skipped
   # (found 2026-07-13 when the first live cascade bumps landed).
-  { pattern = "pilotprotocol.network/api/*", custom_domain = false },
+  # Only /api/changelog: the website serves the rest of /api (docs search,
+  # uploads, the Payload admin API), and this worker 404s every other path.
+  { pattern = "pilotprotocol.network/api/changelog", custom_domain = false },
 ]
 
 [vars]
